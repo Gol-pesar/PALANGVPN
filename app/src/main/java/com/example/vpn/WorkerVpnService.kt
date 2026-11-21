@@ -24,6 +24,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.amnezia.awg.hevtunnel.TProxyService
+import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ArrayBlockingQueue
@@ -50,6 +52,14 @@ class WorkerVpnService : VpnService() {
         const val EXTRA_PER_APP_ENABLED = "extra_per_app_enabled"
         const val EXTRA_PER_APP_BYPASS_MODE = "extra_per_app_bypass_mode"
         const val EXTRA_PER_APP_PACKAGES = "extra_per_app_packages"
+
+        private const val TUN_IPV4_ADDRESS = "198.18.0.1"
+        private const val TUN_IPV4_PREFIX = 32
+        private const val TUN_IPV6_ADDRESS = "fc00::1"
+        private const val TUN_IPV6_PREFIX = 128
+        // Private benchmark DNS IP so Android 9-16 netd NEVER upgrades system DNS to DoT TCP/853!
+        private const val TUN_DNS_SERVER = "198.18.0.2"
+        private const val TUN_MTU_NATIVE = 8500
 
         private const val NOTIFICATION_CHANNEL_ID = "edgetunnel_vpn_channel"
         private const val NOTIFICATION_ID = 1042
@@ -85,6 +95,7 @@ class WorkerVpnService : VpnService() {
     private var tunOutputStream: FileOutputStream? = null
     private val tunWriteQueue = ArrayBlockingQueue<ByteArray>(4096)
     private val tunRunning = AtomicBoolean(false)
+    private val nativeTunnelRunning = AtomicBoolean(false)
 
     private var wsClient: WorkerWebSocketClient? = null
     private var tcpSessionManager: TcpSessionManager? = null
@@ -171,48 +182,21 @@ class WorkerVpnService : VpnService() {
             is HandshakeTestResult.Success -> {
                 VpnStateHolder.log(
                     LogLevel.SUCCESS,
-                    "تایید ورکر موفق (${verifyResult.latencyMs}ms) — راه‌اندازی رابط TUN…"
+                    "تایید ورکر موفق (${verifyResult.latencyMs}ms) — راه‌اندازی موتور بومی lwIP…"
                 )
             }
         }
 
         try {
-            val builder = Builder()
-                .setSession("EdgeTunnel - ${config.profileName}")
-                .setMtu(1500)
-                .addAddress("10.0.0.2", 32)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-
-            // Apply Per-App Proxy & strictly enforce Self-Bypass so EdgeTunnel NEVER loops into itself!
-            applyPerAppRoutingAndSelfBypass(builder, config)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setMetered(false)
-            }
-
-            val pfd = builder.establish()
-            if (pfd == null) {
-                val msg = "ایجاد رابط TUN ناموفق بود (مجوز VPN بررسی شود)"
-                VpnStateHolder.log(LogLevel.ERROR, msg)
-                VpnStateHolder.setState(VpnConnectionState.Error(msg))
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return
-            }
-
-            tunInterface = pfd
-            tunOutputStream = FileOutputStream(pfd.fileDescriptor)
-            tunWriteQueue.clear()
-            tunRunning.set(true)
             totalUploadBytes.set(0L)
             totalDownloadBytes.set(0L)
 
-            startTunWriterLoop(tunOutputStream!!)
-
-            val client = WorkerWebSocketClient(config)
+            val client = WorkerWebSocketClient(
+                config = config,
+                protectSocket = { sock -> protect(sock) }
+            )
             wsClient = client
-            // Pre-warm 4 idle TLS+WebSocket connections immediately for 0ms checkout!
+            // Pre-warm 8 idle TLS+WebSocket connections immediately for 0ms checkout!
             client.startWarmPool(serviceScope)
 
             val dnsHandler = DnsProxyHandler(
@@ -227,31 +211,104 @@ class WorkerVpnService : VpnService() {
             dnsProxyHandler = dnsHandler
             dnsHandler.prewarm()
 
-            val tcpManager = TcpSessionManager(
+            // Start our high-throughput local SOCKS5 server BEFORE opening native TUN
+            val desiredPort = if (config.localSocksEnabled) config.localSocksPort else 0
+            val socks = LocalSocks5Server(
+                requestedPort = desiredPort,
                 scope = serviceScope,
                 wsClient = client,
+                dnsHandler = dnsHandler,
+                fakeDnsEnabled = config.fakeDnsEnabled,
                 sniSniffingEnabled = config.sniSniffingEnabled,
-                lookupDomain = dnsHandler::lookupDomainForIp,
-                writePacketToTun = ::enqueueTunWrite,
                 onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
                 onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
             )
-            tcpSessionManager = tcpManager
-
-            var socksAddress: String? = null
-            if (config.localSocksEnabled) {
-                val socks = LocalSocks5Server(
-                    port = config.localSocksPort,
+            var socksStarted = socks.start()
+            if (!socksStarted && desiredPort != 0) {
+                // Retry on ephemeral loopback port if 10808 is occupied
+                val fallbackSocks = LocalSocks5Server(
+                    requestedPort = 0,
                     scope = serviceScope,
                     wsClient = client,
+                    dnsHandler = dnsHandler,
+                    fakeDnsEnabled = config.fakeDnsEnabled,
+                    sniSniffingEnabled = config.sniSniffingEnabled,
                     onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
                     onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
                 )
-                if (socks.start()) {
-                    localSocks5Server = socks
-                    socksAddress = "127.0.0.1:${config.localSocksPort}"
-                    VpnStateHolder.log(LogLevel.INFO, "پروکسی محلی SOCKS5 فعال شد: $socksAddress")
+                if (fallbackSocks.start()) {
+                    localSocks5Server = fallbackSocks
+                    socksStarted = true
                 }
+            } else if (socksStarted) {
+                localSocks5Server = socks
+            }
+
+            val activeSocks = localSocks5Server
+            val socksPort = activeSocks?.boundPort ?: config.localSocksPort
+            val socksAddress = if (socksStarted && config.localSocksEnabled) "127.0.0.1:$socksPort" else null
+
+            val builder = Builder()
+                .setSession("EdgeTunnel - ${config.profileName}")
+                .setMtu(if (socksStarted) TUN_MTU_NATIVE else 1500)
+                .addAddress(TUN_IPV4_ADDRESS, TUN_IPV4_PREFIX)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer(TUN_DNS_SERVER)
+
+            if (socksStarted) {
+                builder
+                    .addAddress(TUN_IPV6_ADDRESS, TUN_IPV6_PREFIX)
+                    .addRoute("::", 0)
+            }
+
+            // Apply Per-App Proxy & strictly enforce Self-Bypass so EdgeTunnel NEVER loops into itself!
+            applyPerAppRoutingAndSelfBypass(builder, config)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+            }
+
+            val pfd = builder.establish()
+            if (pfd == null) {
+                val msg = "ایجاد رابط TUN ناموفق بود (مجوز VPN بررسی شود)"
+                VpnStateHolder.log(LogLevel.ERROR, msg)
+                VpnStateHolder.setState(VpnConnectionState.Error(msg))
+                stopTunnel(updateState = false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            tunInterface = pfd
+            tunRunning.set(true)
+
+            // Primary engine: Native C lwIP (hev-socks5-tunnel) — same core engine used by v2rayNG!
+            var startedNative = false
+            if (socksStarted) {
+                startedNative = tryStartNativeHevTunnel(
+                    tunFd = pfd.fd,
+                    socksPort = socksPort,
+                    fakeDnsEnabled = config.fakeDnsEnabled
+                )
+            }
+
+            if (!startedNative) {
+                // Safe fallback: pure-Kotlin user-space TUN loop if native JNI ever fails
+                VpnStateHolder.log(LogLevel.WARN, "موتور بومی در دسترس نبود — فعال‌سازی موتور پشتیبان Kotlin")
+                tunOutputStream = FileOutputStream(pfd.fileDescriptor)
+                tunWriteQueue.clear()
+                startTunWriterLoop(tunOutputStream!!)
+                val tcpManager = TcpSessionManager(
+                    scope = serviceScope,
+                    wsClient = client,
+                    sniSniffingEnabled = config.sniSniffingEnabled,
+                    lookupDomain = dnsHandler::lookupDomainForIp,
+                    writePacketToTun = ::enqueueTunWrite,
+                    onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
+                    onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
+                )
+                tcpSessionManager = tcpManager
+                startPacketLoop(pfd, tcpManager, dnsHandler)
             }
 
             val resolvedClean = endpoint.cleanIpHost ?: client.lastResolvedIp
@@ -267,19 +324,22 @@ class WorkerVpnService : VpnService() {
                 subtitle = "${config.profileName} • $resolvedClean"
             )
 
+            val engineTag = if (startedNative) "Native lwIP C (MTU 8500)" else "Kotlin TCP"
             val dnsSummary = buildList {
-                if (config.fakeDnsEnabled) add("FakeDNS")
+                if (config.fakeDnsEnabled) add(if (startedNative) "Native FakeDNS" else "FakeDNS")
                 if (config.localDnsEnabled) add("LocalDNS(DoH)")
                 if (isEmpty()) add("RemoteDNS")
             }.joinToString("+")
 
             VpnStateHolder.log(
                 LogLevel.SUCCESS,
-                "تونل فعال شد (WarmPool 0-RTT • NewReno TCP • $dnsSummary • Self-Bypass)"
+                "تونل فعال شد ($engineTag • WarmPool×8 0-RTT • $dnsSummary • Self-Bypass)"
             )
+            if (socksAddress != null) {
+                VpnStateHolder.log(LogLevel.INFO, "پروکسی محلی SOCKS5 فعال: $socksAddress")
+            }
 
             startStatsTicker(socksAddress)
-            startPacketLoop(pfd, tcpManager, dnsHandler)
         } catch (e: Exception) {
             val msg = "خطا در راه‌اندازی تونل: ${e.message ?: "نامشخص"}"
             VpnStateHolder.log(LogLevel.ERROR, msg)
@@ -287,6 +347,54 @@ class WorkerVpnService : VpnService() {
             stopTunnel(updateState = false)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    /**
+     * Generates hev-socks5-tunnel YAML config and launches the native C lwIP engine directly
+     * on the Android TUN file descriptor.
+     */
+    private fun tryStartNativeHevTunnel(
+        tunFd: Int,
+        socksPort: Int,
+        fakeDnsEnabled: Boolean
+    ): Boolean {
+        return try {
+            val configFile = File(cacheDir, "hev_tun_config.yml")
+            val yaml = buildString {
+                appendLine("tunnel:")
+                appendLine("  mtu: $TUN_MTU_NATIVE")
+                appendLine("  ipv4: $TUN_IPV4_ADDRESS")
+                appendLine("  ipv6: '$TUN_IPV6_ADDRESS'")
+                appendLine("  multi-queue: false")
+                appendLine("socks5:")
+                appendLine("  port: $socksPort")
+                appendLine("  address: 127.0.0.1")
+                appendLine("  udp: 'udp'")
+                appendLine("  pipeline: true")
+                if (fakeDnsEnabled) {
+                    appendLine("mapdns:")
+                    appendLine("  address: $TUN_DNS_SERVER")
+                    appendLine("  port: 53")
+                    appendLine("  network: 100.64.0.0")
+                    appendLine("  netmask: 255.192.0.0")
+                    appendLine("  cache-size: 10000")
+                }
+                appendLine("misc:")
+                appendLine("  task-stack-size: 81920")
+                appendLine("  tcp-buffer-size: 65536")
+                appendLine("  connect-timeout: 10000")
+                appendLine("  read-write-timeout: 300000")
+                appendLine("  log-level: warn")
+            }
+            configFile.writeText(yaml)
+            TProxyService.TProxyStartService(configFile.absolutePath, tunFd)
+            nativeTunnelRunning.set(true)
+            true
+        } catch (t: Throwable) {
+            VpnStateHolder.log(LogLevel.WARN, "خطا در شروع موتور بومی hev-socks5-tunnel: ${t.message}")
+            nativeTunnelRunning.set(false)
+            false
         }
     }
 
@@ -301,7 +409,6 @@ class WorkerVpnService : VpnService() {
             .filter { it.isNotEmpty() && it != selfPkg }
 
         if (config.perAppEnabled && !config.perAppBypassMode && filteredPackages.isNotEmpty()) {
-            // Allowed-Only mode: route ONLY selected apps; selfPkg is strictly excluded -> auto-bypassed!
             var added = 0
             for (pkg in filteredPackages) {
                 try {
@@ -394,7 +501,6 @@ class WorkerVpnService : VpnService() {
                         if (udp.dstPort == 53) {
                             dnsHandler.handleUdpDnsPacket(ip, udp, buffer)
                         } else {
-                            // Instantly reject UDP/443 (QUIC) & non-DNS UDP with ICMP Port Unreachable
                             val icmpUnreachable = PacketUtils.buildIpv4IcmpPortUnreachable(buffer, ip)
                             enqueueTunWrite(icmpUnreachable)
                         }
@@ -417,12 +523,17 @@ class WorkerVpnService : VpnService() {
                 val downSpeed = (down - prevDown).coerceAtLeast(0L)
                 prevUp = up
                 prevDown = down
+                val activeCount = if (nativeTunnelRunning.get()) {
+                    localSocks5Server?.activeSessionCount ?: 0
+                } else {
+                    tcpSessionManager?.activeSessionCount ?: 0
+                }
                 VpnStateHolder.updateStats(
                     uploadBytes = up,
                     downloadBytes = down,
                     uploadSpeedBps = upSpeed,
                     downloadSpeedBps = downSpeed,
-                    activeTunnels = tcpSessionManager?.activeSessionCount ?: 0,
+                    activeTunnels = activeCount,
                     socksProxyAddress = socksAddress
                 )
             }
@@ -437,6 +548,10 @@ class WorkerVpnService : VpnService() {
         tunWriterJob = null
         statsJob?.cancel()
         statsJob = null
+
+        if (nativeTunnelRunning.compareAndSet(true, false)) {
+            runCatching { TProxyService.TProxyStopService() }
+        }
 
         localSocks5Server?.stop()
         localSocks5Server = null

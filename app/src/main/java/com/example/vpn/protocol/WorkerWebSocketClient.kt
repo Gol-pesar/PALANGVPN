@@ -22,15 +22,18 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.Socket
 import java.net.UnknownHostException
 import java.util.ArrayDeque
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.SocketFactory
 
 sealed interface HandshakeTestResult {
@@ -39,19 +42,23 @@ sealed interface HandshakeTestResult {
 }
 
 /**
- * Ultra-low-latency OkHttp WebSocket & Local DoH engine for worker_534a9c26.js:
- * - Pre-Warmed WebSocket Pool (4 idle TLS+WS connections ready for 0ms checkout)
- * - 0-RTT Data Pipelining (sends XOR-encrypted initial client payload right after Init,
- *   utilizing the worker's st.q queue while still strictly verifying HMAC-SHA256 "OK" ACK)
- * - 256 concurrent per-host connections + TCP_NODELAY + 128KB socket buffers
- * - Built-in HTTP/2 DoH client routed through the user's Clean IP for Local DNS on port 443
+ * High-speed OkHttp WebSocket & Local DoH engine for worker_534a9c26.js:
+ * - Pre-Warmed WebSocket Pool (8 idle TLS+WS connections ready for 0ms checkout)
+ * - Race-free 0-RTT first-flight pipelining (sends exactly ONE coalesced client payload frame
+ *   right after Init, holding any 2nd+ frames until HMAC-SHA256 "OK" ACK so the worker's
+ *   st.q queue can NEVER be overtaken out of order by st.wr!)
+ * - IPv4-first hostname-keyed DNS cache (avoids ISP IPv6 blackhole stalls)
+ * - Circuit-breaker Local DoH (HTTP/2 port 443 via Clean IP with fast fallback to Google DoH)
+ * - Optional VpnService.protect() socket hook alongside Self-Bypass
  */
 class WorkerWebSocketClient(
-    private val config: WorkerConfig
+    private val config: WorkerConfig,
+    private val protectSocket: ((Socket) -> Boolean)? = null
 ) {
     companion object {
-        private const val WARM_POOL_TARGET = 4
-        private const val WARM_MAX_AGE_MS = 24_000L
+        private const val WARM_POOL_TARGET = 8
+        private const val WARM_MAX_AGE_MS = 28_000L
+        private const val DOH_CIRCUIT_COOLDOWN_MS = 60_000L
         private val DNS_MESSAGE_MEDIA_TYPE = "application/dns-message".toMediaType()
 
         suspend fun testHandshake(config: WorkerConfig): HandshakeTestResult {
@@ -116,6 +123,8 @@ class WorkerWebSocketClient(
         }
     }
 
+    private data class CachedDnsEntry(val addresses: List<InetAddress>, val resolvedAtMs: Long)
+
     private val endpoint: ParsedWorkerEndpoint =
         config.parseEndpoint() ?: throw IllegalArgumentException("Invalid Worker URL")
 
@@ -123,34 +132,50 @@ class WorkerWebSocketClient(
     var lastResolvedIp: String = endpoint.cleanIpHost ?: endpoint.workerHost
         private set
 
-    @Volatile
-    private var cachedAddresses: List<InetAddress>? = null
-
-    @Volatile
-    private var cachedAtMs: Long = 0L
-
+    private val dnsCache = ConcurrentHashMap<String, CachedDnsEntry>()
     private val isShutdown = AtomicBoolean(false)
+
+    // Circuit breaker for Cloudflare DoH via Clean IP (prevents repeated timeouts if Clean IP doesn't serve DoH)
+    private val cfDohConsecutiveFailures = AtomicInteger(0)
+    private val cfDohBlockedUntilMs = AtomicLong(0L)
+
+    private fun preferIpv4Order(raw: List<InetAddress>, explicitIpv6Literal: Boolean): List<InetAddress> {
+        if (explicitIpv6Literal || raw.size <= 1) return raw
+        val v4 = raw.filterIsInstance<Inet4Address>()
+        val others = raw.filter { it !is Inet4Address }
+        return if (v4.isNotEmpty()) v4 + others else raw
+    }
 
     private val customDns = object : Dns {
         override fun lookup(hostname: String): List<InetAddress> {
+            val cleanHost = endpoint.cleanIpHost
+            val cacheKey = if (!cleanHost.isNullOrBlank()) "clean:$cleanHost" else "host:$hostname"
             val now = System.currentTimeMillis()
-            val cached = cachedAddresses
-            if (cached != null && now - cachedAtMs < 120_000L) {
-                return cached
+            val cached = dnsCache[cacheKey]
+            if (cached != null && now - cached.resolvedAtMs < 120_000L) {
+                return cached.addresses
             }
 
-            val cleanHost = endpoint.cleanIpHost
             val resolved = if (!cleanHost.isNullOrBlank()) {
-                val addresses = InetAddress.getAllByName(cleanHost).toList()
-                if (addresses.isEmpty()) throw UnknownHostException("Clean IP unresolved: $cleanHost")
-                addresses
+                val raw = InetAddress.getAllByName(cleanHost).toList()
+                if (raw.isEmpty()) throw UnknownHostException("Clean IP unresolved: $cleanHost")
+                preferIpv4Order(raw, explicitIpv6Literal = cleanHost.contains(':'))
             } else {
-                Dns.SYSTEM.lookup(hostname)
+                val raw = Dns.SYSTEM.lookup(hostname)
+                preferIpv4Order(raw, explicitIpv6Literal = false)
             }
-            resolved.firstOrNull()?.hostAddress?.let { lastResolvedIp = it }
-            cachedAddresses = resolved
-            cachedAtMs = now
+            if (hostname.equals(endpoint.workerHost, ignoreCase = true) || !cleanHost.isNullOrBlank()) {
+                resolved.firstOrNull()?.hostAddress?.let { lastResolvedIp = it }
+            }
+            dnsCache[cacheKey] = CachedDnsEntry(resolved, now)
             return resolved
+        }
+    }
+
+    private val directIpv4FirstDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            val raw = Dns.SYSTEM.lookup(hostname)
+            return preferIpv4Order(raw, explicitIpv6Literal = false)
         }
     }
 
@@ -159,9 +184,10 @@ class WorkerWebSocketClient(
 
         private fun tune(socket: Socket): Socket = socket.apply {
             runCatching {
+                protectSocket?.invoke(this)
                 tcpNoDelay = true
-                sendBufferSize = 131_072
-                receiveBufferSize = 131_072
+                sendBufferSize = 262_144
+                receiveBufferSize = 262_144
             }
         }
 
@@ -176,7 +202,7 @@ class WorkerWebSocketClient(
 
     private val highConcurrencyDispatcher = Dispatcher(
         ThreadPoolExecutor(
-            8,
+            12,
             256,
             60L,
             TimeUnit.SECONDS,
@@ -192,7 +218,7 @@ class WorkerWebSocketClient(
         .dns(customDns)
         .socketFactory(lowLatencySocketFactory)
         .protocols(listOf(Protocol.HTTP_1_1))
-        .connectTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(7, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .pingInterval(25, TimeUnit.SECONDS)
@@ -203,17 +229,18 @@ class WorkerWebSocketClient(
     private val dohCleanIpClient: OkHttpClient = OkHttpClient.Builder()
         .dns(customDns)
         .socketFactory(lowLatencySocketFactory)
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
-        .writeTimeout(4, TimeUnit.SECONDS)
+        .connectTimeout(1800, TimeUnit.MILLISECONDS)
+        .readTimeout(1800, TimeUnit.MILLISECONDS)
+        .writeTimeout(1800, TimeUnit.MILLISECONDS)
         .build()
 
-    // Fallback direct HTTP/2 DoH client (system DNS, bypassed from VPN via self-bypass)
+    // Fallback direct HTTP/2 DoH client (IPv4-first system DNS, bypassed from VPN via self-bypass)
     private val dohDirectClient: OkHttpClient = OkHttpClient.Builder()
+        .dns(directIpv4FirstDns)
         .socketFactory(lowLatencySocketFactory)
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
-        .writeTimeout(4, TimeUnit.SECONDS)
+        .connectTimeout(2500, TimeUnit.MILLISECONDS)
+        .readTimeout(2500, TimeUnit.MILLISECONDS)
+        .writeTimeout(2500, TimeUnit.MILLISECONDS)
         .build()
 
     // Pre-warmed idle WebSocket pool
@@ -295,7 +322,7 @@ class WorkerWebSocketClient(
         warmPoolJob?.cancel()
         warmPoolJob = scope.launch(Dispatchers.IO) {
             while (isActive && !isShutdown.get()) {
-                delay(6_000L)
+                delay(5_000L)
                 pruneExpiredWarmSlots()
                 refillWarmPool()
             }
@@ -338,7 +365,7 @@ class WorkerWebSocketClient(
                         runCatching { ws.close(1000, "shutdown") }
                     } else {
                         val added = synchronized(poolLock) {
-                            if (warmPool.size < WARM_POOL_TARGET + 2) {
+                            if (warmPool.size < WARM_POOL_TARGET + 4) {
                                 warmPool.addLast(WarmSlot(ws, listener, System.currentTimeMillis()))
                                 true
                             } else false
@@ -425,7 +452,7 @@ class WorkerWebSocketClient(
             onBytesReceived = onBytesReceived
         )
 
-        // Fast-path: use a pre-warmed already-open WebSocket (0ms TCP+TLS+WS setup!)
+        // Fast-path: check out a pre-warmed already-open WebSocket (0ms TCP+TLS+WS setup!)
         val warm = checkoutWarmSlot()
         if (warm != null && warm.delegate.attachTarget(session.listener)) {
             if (session.attachWarmOpenWebSocket(warm.webSocket)) {
@@ -443,20 +470,29 @@ class WorkerWebSocketClient(
 
     /**
      * Resolves raw RFC 1035 DNS wire query via Local DNS-over-HTTPS (port 443 HTTP/2),
-     * trying Cloudflare DoH through the user's Clean IP first, then direct Google DoH.
+     * trying Cloudflare DoH through the user's Clean IP first (with circuit breaker), then direct Google DoH.
      */
     fun queryLocalDoh(dnsWireQuery: ByteArray): ByteArray? {
         if (isShutdown.get()) return null
+        val now = System.currentTimeMillis()
 
-        // 1) Cloudflare DoH over user's Clean IP (1-RTT port 443, immune to port 53 blocks)
-        val cfAttempt = executeDohPost(
-            client = dohCleanIpClient,
-            url = "https://cloudflare-dns.com/dns-query",
-            dnsWireQuery = dnsWireQuery
-        )
-        if (cfAttempt != null) return cfAttempt
+        // 1) Cloudflare DoH over user's Clean IP (unless circuit breaker is cooling down)
+        if (now >= cfDohBlockedUntilMs.get()) {
+            val cfAttempt = executeDohPost(
+                client = dohCleanIpClient,
+                url = "https://cloudflare-dns.com/dns-query",
+                dnsWireQuery = dnsWireQuery
+            )
+            if (cfAttempt != null) {
+                cfDohConsecutiveFailures.set(0)
+                return cfAttempt
+            }
+            if (cfDohConsecutiveFailures.incrementAndGet() >= 2) {
+                cfDohBlockedUntilMs.set(now + DOH_CIRCUIT_COOLDOWN_MS)
+            }
+        }
 
-        // 2) Fallback: Direct Google DoH (bypassed from VPN via self-bypass)
+        // 2) Fallback: Direct Google DoH (bypassed from VPN via Self-Bypass)
         return executeDohPost(
             client = dohDirectClient,
             url = "https://dns.google/dns-query",
@@ -527,6 +563,9 @@ class WorkerTunnelSession(
     private var initSent = false
 
     @Volatile
+    private var firstZeroRttFrameSent = false
+
+    @Volatile
     private var ackVerified = false
 
     private val closed = AtomicBoolean(false)
@@ -545,10 +584,11 @@ class WorkerTunnelSession(
 
     /**
      * Immediately activates an already-open pre-warmed WebSocket, sending Init and
-     * flushing any queued 0-RTT payload in the same instant.
+     * at most ONE coalesced 0-RTT initial payload frame so the worker's st.q queue
+     * is NEVER overtaken out-of-order.
      */
     internal fun attachWarmOpenWebSocket(ws: WebSocket): Boolean {
-        val toFlush: List<ByteArray>
+        val firstChunk: ByteArray?
         synchronized(lock) {
             if (closed.get()) return false
             webSocket = ws
@@ -558,23 +598,36 @@ class WorkerTunnelSession(
                 return false
             }
             initSent = true
-            toFlush = drainPendingLocked()
+            firstChunk = coalescePendingIntoSingleFrameLocked()
+            if (firstChunk != null) {
+                firstZeroRttFrameSent = true
+            }
         }
-        flushChunks(ws, toFlush)
+        if (firstChunk != null) {
+            sendEncryptedFrame(ws, firstChunk)
+        }
         return true
     }
 
     /**
-     * 0-RTT pipelined send: as soon as WebSocket is open and Init has been transmitted,
-     * immediately sends XOR-encrypted data frames without waiting an extra RTT for the
-     * worker's HMAC ACK (the worker queues them in st.q and drains right after dial()).
+     * Race-free 0-RTT pipelined send matching worker_534a9c26.js lines 53-74:
+     * - Before Init is sent: queues data to be coalesced into ONE 0-RTT frame on open.
+     * - After Init, before ACK: sends AT MOST ONE 0-RTT frame (e.g. TLS ClientHello / HTTP GET)
+     *   immediately, and queues any 2nd+ frame until ACK arrives (guaranteeing strict FIFO order
+     *   in the worker even while dial() transitions st.q -> st.wr!).
+     * - After ACK verified: streams directly with zero buffering.
      */
     fun send(plaintext: ByteArray): Boolean {
         if (plaintext.isEmpty()) return true
         val wsToSend: WebSocket?
         synchronized(lock) {
             if (closed.get()) return false
-            if (!initSent) {
+            if (ackVerified) {
+                wsToSend = webSocket
+            } else if (initSent && !firstZeroRttFrameSent) {
+                firstZeroRttFrameSent = true
+                wsToSend = webSocket
+            } else {
                 if (pendingBytes + plaintext.size > maxQueueBytes) {
                     closeInternal("صف ارسال پر شد")
                     return false
@@ -583,9 +636,17 @@ class WorkerTunnelSession(
                 pendingBytes += plaintext.size
                 return true
             }
-            wsToSend = webSocket
         }
         val ws = wsToSend ?: return false
+        return sendEncryptedFrame(ws, plaintext)
+    }
+
+    fun close() {
+        closeInternal(null)
+    }
+
+    private fun sendEncryptedFrame(ws: WebSocket, plaintext: ByteArray): Boolean {
+        if (closed.get()) return false
         val encrypted = WorkerCrypto.xorBytes(plaintext, handshake.key)
         val sent = ws.send(encrypted.toByteString())
         if (sent) {
@@ -594,8 +655,22 @@ class WorkerTunnelSession(
         return sent
     }
 
-    fun close() {
-        closeInternal(null)
+    private fun coalescePendingIntoSingleFrameLocked(): ByteArray? {
+        if (pendingQueue.isEmpty()) return null
+        if (pendingQueue.size == 1) {
+            val single = pendingQueue.removeFirst()
+            pendingBytes = 0
+            return single
+        }
+        val combined = ByteArray(pendingBytes)
+        var offset = 0
+        while (pendingQueue.isNotEmpty()) {
+            val chunk = pendingQueue.removeFirst()
+            System.arraycopy(chunk, 0, combined, offset, chunk.size)
+            offset += chunk.size
+        }
+        pendingBytes = 0
+        return combined
     }
 
     private fun drainPendingLocked(): List<ByteArray> {
@@ -606,16 +681,6 @@ class WorkerTunnelSession(
         }
         pendingBytes = 0
         return list
-    }
-
-    private fun flushChunks(ws: WebSocket, chunks: List<ByteArray>) {
-        for (chunk in chunks) {
-            if (closed.get()) return
-            val enc = WorkerCrypto.xorBytes(chunk, handshake.key)
-            if (ws.send(enc.toByteString())) {
-                onBytesSent(chunk.size)
-            }
-        }
     }
 
     private fun closeInternal(reason: String?) {
@@ -636,7 +701,7 @@ class WorkerTunnelSession(
 
     internal val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            val toFlush: List<ByteArray>
+            val firstChunk: ByteArray?
             synchronized(lock) {
                 if (closed.get()) {
                     webSocket.close(1000, "cancelled")
@@ -649,10 +714,14 @@ class WorkerTunnelSession(
                     return
                 }
                 initSent = true
-                toFlush = drainPendingLocked()
+                firstChunk = coalescePendingIntoSingleFrameLocked()
+                if (firstChunk != null) {
+                    firstZeroRttFrameSent = true
+                }
             }
-            // Immediately pipeline queued 0-RTT data (e.g. TLS ClientHello) without waiting for ACK!
-            flushChunks(webSocket, toFlush)
+            if (firstChunk != null) {
+                sendEncryptedFrame(webSocket, firstChunk)
+            }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -663,7 +732,14 @@ class WorkerTunnelSession(
                     closeInternal("تاییدیه HMAC-SHA256 ورکر نامعتبر است (UUID را بررسی کنید)")
                     return
                 }
-                ackVerified = true
+                val queuedAfterZeroRtt: List<ByteArray>
+                synchronized(lock) {
+                    ackVerified = true
+                    queuedAfterZeroRtt = drainPendingLocked()
+                }
+                for (chunk in queuedAfterZeroRtt) {
+                    if (!sendEncryptedFrame(webSocket, chunk)) break
+                }
                 onReady()
                 return
             }

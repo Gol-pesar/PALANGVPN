@@ -111,22 +111,51 @@ class DnsProxyHandler(
         }
 
         scope.launch(Dispatchers.IO) {
-            val response = if (question != null) {
-                resolveWithDeduplication(dnsQuery, question)
-            } else {
-                resolveUpstream(dnsQuery)
-            } ?: return@launch
-
-            if (question != null && question.qtype == 1) {
-                cacheARecords(response, question.domain)
-            }
-            val finalReply = response.copyOf()
-            if (finalReply.size >= 2) {
-                finalReply[0] = dnsQuery[0]
-                finalReply[1] = dnsQuery[1]
-            }
-            sendUdpReply(ip, udp, finalReply)
+            val reply = resolveRawDnsQuery(dnsQuery) ?: return@launch
+            sendUdpReply(ip, udp, reply)
         }
+    }
+
+    /**
+     * Resolves a raw RFC 1035 DNS wire query for either the TUN packet handler or
+     * LocalSocks5Server's RFC 1928 UDP ASSOCIATE relay (when Fake DNS is turned off).
+     */
+    suspend fun resolveRawDnsQuery(dnsQuery: ByteArray): ByteArray? {
+        if (closed || dnsQuery.size < 12) return null
+        val question = parseQuestion(dnsQuery)
+
+        // Suppress AAAA (28) & HTTPS/SVCB (65) on IPv4-only TUN to stop IPv6/QUIC stalls
+        if (question != null && (question.qtype == 28 || question.qtype == 65)) {
+            return buildEmptyNoErrorResponse(dnsQuery, question.questionEndOffset)
+        }
+
+        // TTL-aware cache hit (<0.2ms)
+        if (question != null) {
+            val cacheKey = CacheKey(question.domain.lowercase(), question.qtype)
+            val cached = dnsResponseCache[cacheKey]
+            if (cached != null && System.currentTimeMillis() < cached.expiresAtMs) {
+                val reply = cached.wireResponse.copyOf()
+                reply[0] = dnsQuery[0]
+                reply[1] = dnsQuery[1]
+                return reply
+            }
+        }
+
+        val response = if (question != null) {
+            resolveWithDeduplication(dnsQuery, question)
+        } else {
+            resolveUpstream(dnsQuery)
+        } ?: return null
+
+        if (question != null && question.qtype == 1) {
+            cacheARecords(response, question.domain)
+        }
+        val finalReply = response.copyOf()
+        if (finalReply.size >= 2) {
+            finalReply[0] = dnsQuery[0]
+            finalReply[1] = dnsQuery[1]
+        }
+        return finalReply
     }
 
     private suspend fun resolveWithDeduplication(

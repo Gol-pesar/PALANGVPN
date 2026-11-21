@@ -236,4 +236,60 @@ class WorkerProtocolTest {
             PacketUtils.extractHttpHost("GET / HTTP/1.1\r\nHost: example.org:80\r\n\r\n".toByteArray())
         )
     }
+
+    @Test
+    fun packetUtils_synAckOptionsAndIcmpUnreachableAreValid() {
+        val synAck = PacketUtils.buildIpv4TcpPacket(
+            srcIp = 0x08080808,
+            dstIp = 0x0A000002,
+            srcPort = 443,
+            dstPort = 51234,
+            seqNum = 9000L,
+            ackNum = 1001L,
+            flags = PacketUtils.TCP_SYN or PacketUtils.TCP_ACK,
+            includeSynOptions = true,
+            windowScaleShift = PacketUtils.DEFAULT_WINDOW_SCALE,
+            mssValue = PacketUtils.DEFAULT_MSS
+        )
+
+        val ip = PacketUtils.parseIpv4Header(synAck, synAck.size)
+        assertNotNull(ip)
+        assertEquals(0, PacketUtils.computeChecksum(synAck, 0, ip!!.headerLength))
+
+        val tcp = PacketUtils.parseTcpHeader(synAck, ip)
+        assertNotNull(tcp)
+        assertEquals(28, tcp!!.headerLength)
+        assertEquals(PacketUtils.DEFAULT_MSS, tcp.mss)
+        assertEquals(PacketUtils.DEFAULT_WINDOW_SCALE, tcp.windowScaleShift)
+        assertEquals(
+            0,
+            PacketUtils.computeTransportChecksum(
+                srcIp = ip.srcIp,
+                dstIp = ip.dstIp,
+                protocol = PacketUtils.PROTOCOL_TCP,
+                packet = synAck,
+                transportOffset = ip.headerLength,
+                transportLength = ip.totalLength - ip.headerLength
+            )
+        )
+
+        val quicUdp = PacketUtils.buildIpv4UdpPacket(
+            srcIp = 0x0A000002,
+            dstIp = 0x8EFAA04E.toInt(),
+            srcPort = 55000,
+            dstPort = 443,
+            payload = ByteArray(32) { 0x42 }
+        )
+        val quicIp = PacketUtils.parseIpv4Header(quicUdp, quicUdp.size)!!
+        val icmp = PacketUtils.buildIpv4IcmpPortUnreachable(quicUdp, quicIp)
+        val icmpIp = PacketUtils.parseIpv4Header(icmp, icmp.size)!!
+        assertEquals(PacketUtils.PROTOCOL_ICMP, icmpIp.protocol)
+        assertEquals(0, PacketUtils.computeChecksum(icmp, 0, icmpIp.headerLength))
+        assertEquals(0, PacketUtils.computeChecksum(icmp, icmpIp.headerLength, icmpIp.totalLength - icmpIp.headerLength))
+        assertEquals(3, icmp[icmpIp.headerLength].toInt() and 0xFF)
+        assertEquals(3, icmp[icmpIp.headerLength + 1].toInt() and 0xFF)
+
+        assertTrue(PacketUtils.seqDiff(0x00000005L, 0xFFFFFFFBL) == 10L)
+        assertTrue(PacketUtils.seqDiff(0xFFFFFFFBL, 0x00000005L) == -10L)
+    }
 }

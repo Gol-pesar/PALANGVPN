@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
 
 object PacketUtils {
+    const val PROTOCOL_ICMP = 1
     const val PROTOCOL_TCP = 6
     const val PROTOCOL_UDP = 17
 
@@ -12,6 +13,9 @@ object PacketUtils {
     const val TCP_RST = 0x04
     const val TCP_PSH = 0x08
     const val TCP_ACK = 0x10
+
+    const val DEFAULT_MSS = 1360
+    const val DEFAULT_WINDOW_SCALE = 7 // 65535 << 7 = ~8MB advertised receive window
 
     private val ipIdGenerator = AtomicInteger(1)
 
@@ -31,6 +35,8 @@ object PacketUtils {
         val headerLength: Int,
         val flags: Int,
         val windowSize: Int,
+        val windowScaleShift: Int?,
+        val mss: Int?,
         val payloadOffset: Int,
         val payloadLength: Int
     )
@@ -73,6 +79,34 @@ object PacketUtils {
         if (dataOffset < 20 || offset + dataOffset > ip.totalLength) return null
         val flags = packet[offset + 13].toInt() and 0xFF
         val windowSize = readUInt16(packet, offset + 14)
+
+        var windowScale: Int? = null
+        var mss: Int? = null
+        if (dataOffset > 20 && (flags and TCP_SYN) != 0) {
+            var optPos = offset + 20
+            val optEnd = offset + dataOffset
+            while (optPos < optEnd) {
+                val kind = packet[optPos].toInt() and 0xFF
+                if (kind == 0) break // End of options
+                if (kind == 1) { // NOP
+                    optPos++
+                    continue
+                }
+                if (optPos + 1 >= optEnd) break
+                val len = packet[optPos + 1].toInt() and 0xFF
+                if (len < 2 || optPos + len > optEnd) break
+                when (kind) {
+                    2 -> if (len == 4) {
+                        mss = readUInt16(packet, optPos + 2)
+                    }
+                    3 -> if (len == 3) {
+                        windowScale = (packet[optPos + 2].toInt() and 0xFF).coerceAtMost(14)
+                    }
+                }
+                optPos += len
+            }
+        }
+
         val payloadOffset = offset + dataOffset
         val payloadLength = (ip.totalLength - payloadOffset).coerceAtLeast(0)
         return TcpHeader(
@@ -83,6 +117,8 @@ object PacketUtils {
             headerLength = dataOffset,
             flags = flags,
             windowSize = windowSize,
+            windowScaleShift = windowScale,
+            mss = mss,
             payloadOffset = payloadOffset,
             payloadLength = payloadLength
         )
@@ -105,6 +141,10 @@ object PacketUtils {
         )
     }
 
+    /**
+     * Builds an IPv4/TCP packet. When [includeSynOptions] is true (for SYN-ACK), attaches
+     * MSS (1360) and optional Window Scale options so Android negotiates large windows cleanly.
+     */
     fun buildIpv4TcpPacket(
         srcIp: Int,
         dstIp: Int,
@@ -116,23 +156,29 @@ object PacketUtils {
         windowSize: Int = 65535,
         payload: ByteArray = ByteArray(0),
         payloadOffset: Int = 0,
-        payloadLength: Int = payload.size
+        payloadLength: Int = payload.size,
+        includeSynOptions: Boolean = false,
+        windowScaleShift: Int? = null,
+        mssValue: Int = DEFAULT_MSS
     ): ByteArray {
         val ipHeaderLen = 20
-        val tcpHeaderLen = 20
+        val optionsLen = if (includeSynOptions) {
+            if (windowScaleShift != null) 8 else 4
+        } else 0
+        val tcpHeaderLen = 20 + optionsLen
         val totalLen = ipHeaderLen + tcpHeaderLen + payloadLength
         val packet = ByteArray(totalLen)
         val buf = ByteBuffer.wrap(packet)
 
         // IPv4 Header
-        buf.put(0x45.toByte()) // Version 4, IHL 5 (20 bytes)
-        buf.put(0x00.toByte()) // DSCP/ECN
+        buf.put(0x45.toByte())
+        buf.put(0x00.toByte())
         buf.putShort(totalLen.toShort())
         buf.putShort((ipIdGenerator.getAndIncrement() and 0xFFFF).toShort())
         buf.putShort(0x4000.toShort()) // Don't Fragment
-        buf.put(64.toByte()) // TTL
+        buf.put(64.toByte())
         buf.put(PROTOCOL_TCP.toByte())
-        buf.putShort(0) // IP checksum placeholder
+        buf.putShort(0)
         buf.putInt(srcIp)
         buf.putInt(dstIp)
 
@@ -141,22 +187,34 @@ object PacketUtils {
         buf.putShort(dstPort.toShort())
         buf.putInt((seqNum and 0xFFFFFFFFL).toInt())
         buf.putInt((ackNum and 0xFFFFFFFFL).toInt())
-        buf.put(0x50.toByte()) // Data offset = 5 (20 bytes)
+        buf.put(((tcpHeaderLen / 4) shl 4).toByte())
         buf.put((flags and 0xFF).toByte())
         buf.putShort((windowSize and 0xFFFF).toShort())
-        buf.putShort(0) // TCP checksum placeholder
-        buf.putShort(0) // Urgent pointer
+        buf.putShort(0)
+        buf.putShort(0)
+
+        if (includeSynOptions) {
+            // Option 2: MSS (4 bytes)
+            buf.put(2.toByte())
+            buf.put(4.toByte())
+            buf.putShort(mssValue.toShort())
+            if (windowScaleShift != null) {
+                // Option 1: NOP + Option 3: Window Scale (3 bytes) = 4 bytes total
+                buf.put(1.toByte())
+                buf.put(3.toByte())
+                buf.put(3.toByte())
+                buf.put(windowScaleShift.coerceIn(0, 14).toByte())
+            }
+        }
 
         if (payloadLength > 0) {
             System.arraycopy(payload, payloadOffset, packet, ipHeaderLen + tcpHeaderLen, payloadLength)
         }
 
-        // Compute IPv4 header checksum
         val ipChecksum = computeChecksum(packet, 0, ipHeaderLen)
         packet[10] = (ipChecksum ushr 8).toByte()
         packet[11] = (ipChecksum and 0xFF).toByte()
 
-        // Compute TCP checksum with IPv4 pseudo-header
         val tcpChecksum = computeTransportChecksum(
             srcIp = srcIp,
             dstIp = dstIp,
@@ -184,7 +242,6 @@ object PacketUtils {
         val packet = ByteArray(totalLen)
         val buf = ByteBuffer.wrap(packet)
 
-        // IPv4 Header
         buf.put(0x45.toByte())
         buf.put(0x00.toByte())
         buf.putShort(totalLen.toShort())
@@ -196,11 +253,10 @@ object PacketUtils {
         buf.putInt(srcIp)
         buf.putInt(dstIp)
 
-        // UDP Header
         buf.putShort(srcPort.toShort())
         buf.putShort(dstPort.toShort())
         buf.putShort(udpLen.toShort())
-        buf.putShort(0) // UDP checksum placeholder
+        buf.putShort(0)
         System.arraycopy(payload, 0, packet, ipHeaderLen + 8, payload.size)
 
         val ipChecksum = computeChecksum(packet, 0, ipHeaderLen)
@@ -218,6 +274,53 @@ object PacketUtils {
         val finalUdpChecksum = if (udpChecksum == 0) 0xFFFF else udpChecksum
         packet[ipHeaderLen + 6] = (finalUdpChecksum ushr 8).toByte()
         packet[ipHeaderLen + 7] = (finalUdpChecksum and 0xFF).toByte()
+
+        return packet
+    }
+
+    /**
+     * Builds an ICMP Destination Unreachable / Port Unreachable (Type 3, Code 3) reply for
+     * unsupported UDP flows (such as QUIC UDP/443) so Chrome/Google apps immediately fall back
+     * to TCP/443 instead of stalling for 5–10 seconds waiting on QUIC timeouts.
+     */
+    fun buildIpv4IcmpPortUnreachable(
+        originalPacket: ByteArray,
+        ip: Ipv4Header
+    ): ByteArray {
+        val quotedLen = (ip.headerLength + 8).coerceAtMost(ip.totalLength)
+        val ipHeaderLen = 20
+        val icmpLen = 8 + quotedLen
+        val totalLen = ipHeaderLen + icmpLen
+        val packet = ByteArray(totalLen)
+        val buf = ByteBuffer.wrap(packet)
+
+        // IPv4 Header (src = original dst, dst = original src)
+        buf.put(0x45.toByte())
+        buf.put(0x00.toByte())
+        buf.putShort(totalLen.toShort())
+        buf.putShort((ipIdGenerator.getAndIncrement() and 0xFFFF).toShort())
+        buf.putShort(0x0000.toShort())
+        buf.put(64.toByte())
+        buf.put(PROTOCOL_ICMP.toByte())
+        buf.putShort(0)
+        buf.putInt(ip.dstIp)
+        buf.putInt(ip.srcIp)
+
+        // ICMP Header: Type 3 (Destination Unreachable), Code 3 (Port Unreachable), 4 zero bytes
+        buf.put(3.toByte())
+        buf.put(3.toByte())
+        buf.putShort(0) // checksum placeholder
+        buf.putInt(0)   // unused
+
+        System.arraycopy(originalPacket, 0, packet, ipHeaderLen + 8, quotedLen)
+
+        val ipChecksum = computeChecksum(packet, 0, ipHeaderLen)
+        packet[10] = (ipChecksum ushr 8).toByte()
+        packet[11] = (ipChecksum and 0xFF).toByte()
+
+        val icmpChecksum = computeChecksum(packet, ipHeaderLen, icmpLen)
+        packet[ipHeaderLen + 2] = (icmpChecksum ushr 8).toByte()
+        packet[ipHeaderLen + 3] = (icmpChecksum and 0xFF).toByte()
 
         return packet
     }
@@ -249,7 +352,6 @@ object PacketUtils {
         transportLength: Int
     ): Int {
         var sum = 0L
-        // Pseudo-header
         sum += (srcIp ushr 16) and 0xFFFF
         sum += srcIp and 0xFFFF
         sum += (dstIp ushr 16) and 0xFFFF
@@ -257,7 +359,6 @@ object PacketUtils {
         sum += protocol and 0xFF
         sum += transportLength and 0xFFFF
 
-        // Transport header + payload
         var i = transportOffset
         val end = transportOffset + transportLength
         while (i + 1 < end) {
@@ -274,41 +375,31 @@ object PacketUtils {
         return (sum.inv() and 0xFFFFL).toInt()
     }
 
-    /**
-     * Extracts Server Name Indication (SNI) from a TLS ClientHello record so the Worker
-     * receives the true domain name instead of only a numeric IP.
-     */
     fun extractTlsSni(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): String? {
         if (length < 43) return null
-        // TLS Record: ContentType = Handshake (0x16), Version = 0x03 0x00..0x04
         if ((data[offset].toInt() and 0xFF) != 0x16) return null
         if ((data[offset + 1].toInt() and 0xFF) != 0x03) return null
 
         var pos = offset + 5
         val end = offset + length
         if (pos + 4 > end) return null
-        // HandshakeType = ClientHello (0x01)
         if ((data[pos].toInt() and 0xFF) != 0x01) return null
-        pos += 4 // type(1) + length(3)
-        pos += 2 + 32 // client_version(2) + random(32)
+        pos += 4
+        pos += 2 + 32
         if (pos + 1 > end) return null
 
-        // Session ID
         val sessionIdLen = data[pos].toInt() and 0xFF
         pos += 1 + sessionIdLen
         if (pos + 2 > end) return null
 
-        // Cipher suites
         val cipherSuitesLen = readUInt16(data, pos)
         pos += 2 + cipherSuitesLen
         if (pos + 1 > end) return null
 
-        // Compression methods
         val compLen = data[pos].toInt() and 0xFF
         pos += 1 + compLen
         if (pos + 2 > end) return null
 
-        // Extensions
         val extTotalLen = readUInt16(data, pos)
         pos += 2
         val extEnd = (pos + extTotalLen).coerceAtMost(end)
@@ -318,8 +409,8 @@ object PacketUtils {
             val extLen = readUInt16(data, pos + 2)
             pos += 4
             if (pos + extLen > extEnd) break
-            if (extType == 0x0000 && extLen >= 5) { // server_name extension
-                var sniPos = pos + 2 // skip server_name_list length
+            if (extType == 0x0000 && extLen >= 5) {
+                var sniPos = pos + 2
                 val sniEnd = pos + extLen
                 while (sniPos + 3 <= sniEnd) {
                     val nameType = data[sniPos].toInt() and 0xFF
@@ -337,9 +428,6 @@ object PacketUtils {
         return null
     }
 
-    /**
-     * Extracts the Host header from a cleartext HTTP/1.x request payload.
-     */
     fun extractHttpHost(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): String? {
         if (length < 16) return null
         val scanLen = length.coerceAtMost(1024)
@@ -391,5 +479,10 @@ object PacketUtils {
 
     fun readUInt32(data: ByteArray, offset: Int): Long {
         return readInt32(data, offset).toLong() and 0xFFFFFFFFL
+    }
+
+    /** Signed 32-bit modular TCP sequence difference: positive if a is ahead of b. */
+    fun seqDiff(a: Long, b: Long): Long {
+        return ((a - b).toInt()).toLong()
     }
 }

@@ -4,6 +4,7 @@ import com.example.vpn.LogLevel
 import com.example.vpn.VpnStateHolder
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
+import okhttp3.Dispatcher
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -14,10 +15,14 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.net.InetAddress
+import java.net.Socket
 import java.net.UnknownHostException
 import java.util.ArrayDeque
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.SocketFactory
 
 sealed interface HandshakeTestResult {
     data class Success(val latencyMs: Int, val resolvedIp: String) : HandshakeTestResult
@@ -25,8 +30,12 @@ sealed interface HandshakeTestResult {
 }
 
 /**
- * Manages OkHttp WebSocket connections to the Cloudflare Worker, supporting Clean IP
- * resolution while preserving TLS SNI and HTTP Host header for the real Worker domain.
+ * High-concurrency OkHttp WebSocket engine tuned for Cloudflare Worker tunneling:
+ * - Uncaps OkHttp's default 5-per-host Dispatcher limit to 256 concurrent WebSocket dials
+ * - Enables TCP_NODELAY and 128KB socket buffers on all outbound sockets
+ * - Caches Clean IP / Worker DNS resolution to eliminate per-tunnel DNS lookup latency
+ * - Uses non-Cloudflare target (www.gstatic.com:80) for ping tests so Workers dial directly
+ *   without tripping Cloudflare-to-Cloudflare loopback blocks
  */
 class WorkerWebSocketClient(
     private val config: WorkerConfig
@@ -38,35 +47,84 @@ class WorkerWebSocketClient(
     var lastResolvedIp: String = endpoint.cleanIpHost ?: endpoint.workerHost
         private set
 
+    @Volatile
+    private var cachedAddresses: List<InetAddress>? = null
+
+    @Volatile
+    private var cachedAtMs: Long = 0L
+
     private val customDns = object : Dns {
         override fun lookup(hostname: String): List<InetAddress> {
+            val now = System.currentTimeMillis()
+            val cached = cachedAddresses
+            if (cached != null && now - cachedAtMs < 60_000L) {
+                return cached
+            }
+
             val cleanHost = endpoint.cleanIpHost
-            return if (!cleanHost.isNullOrBlank()) {
+            val resolved = if (!cleanHost.isNullOrBlank()) {
                 val addresses = InetAddress.getAllByName(cleanHost).toList()
                 if (addresses.isEmpty()) throw UnknownHostException("Clean IP unresolved: $cleanHost")
-                lastResolvedIp = addresses.first().hostAddress ?: cleanHost
                 addresses
             } else {
-                val addresses = Dns.SYSTEM.lookup(hostname)
-                addresses.firstOrNull()?.hostAddress?.let { lastResolvedIp = it }
-                addresses
+                Dns.SYSTEM.lookup(hostname)
             }
+            resolved.firstOrNull()?.hostAddress?.let { lastResolvedIp = it }
+            cachedAddresses = resolved
+            cachedAtMs = now
+            return resolved
         }
     }
 
+    private val lowLatencySocketFactory = object : SocketFactory() {
+        private val delegate = getDefault()
+
+        private fun tune(socket: Socket): Socket = socket.apply {
+            runCatching {
+                tcpNoDelay = true
+                sendBufferSize = 131_072
+                receiveBufferSize = 131_072
+            }
+        }
+
+        override fun createSocket(): Socket = tune(delegate.createSocket())
+        override fun createSocket(host: String?, port: Int): Socket = tune(delegate.createSocket(host, port))
+        override fun createSocket(host: String?, port: Int, localHost: InetAddress?, localPort: Int): Socket =
+            tune(delegate.createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: InetAddress?, port: Int): Socket = tune(delegate.createSocket(host, port))
+        override fun createSocket(address: InetAddress?, port: Int, localAddress: InetAddress?, localPort: Int): Socket =
+            tune(delegate.createSocket(address, port, localAddress, localPort))
+    }
+
+    private val highConcurrencyDispatcher = Dispatcher(
+        ThreadPoolExecutor(
+            8,
+            256,
+            60L,
+            TimeUnit.SECONDS,
+            SynchronousQueue()
+        )
+    ).apply {
+        maxRequests = 256
+        maxRequestsPerHost = 256
+    }
+
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
+        .dispatcher(highConcurrencyDispatcher)
         .dns(customDns)
+        .socketFactory(lowLatencySocketFactory)
         .protocols(listOf(Protocol.HTTP_1_1))
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .pingInterval(25, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+        .retryOnConnectionFailure(false)
         .build()
 
     fun openTunnel(
         targetHost: String,
         targetPort: Int,
+        onWsOpened: () -> Unit = {},
         onReady: () -> Unit = {},
         onData: (ByteArray) -> Unit,
         onClosed: (reason: String?) -> Unit,
@@ -89,6 +147,7 @@ class WorkerWebSocketClient(
 
         val session = WorkerTunnelSession(
             handshake = handshake,
+            onWsOpened = onWsOpened,
             onReady = onReady,
             onData = onData,
             onClosed = onClosed,
@@ -104,12 +163,14 @@ class WorkerWebSocketClient(
     fun shutdown() {
         okHttpClient.dispatcher.cancelAll()
         okHttpClient.connectionPool.evictAll()
+        okHttpClient.dispatcher.executorService.shutdown()
     }
 
     companion object {
         /**
          * Performs a real end-to-end Worker WebSocket handshake + HMAC-SHA256 "OK" ACK check
-         * dialing cp.cloudflare.com:80 through the configured Worker URL, UUID, and Clean IP.
+         * dialing www.gstatic.com:80 (non-Cloudflare fast edge) so the Worker dials directly
+         * without hitting Cloudflare-to-Cloudflare loopback blocks.
          */
         suspend fun testHandshake(config: WorkerConfig): HandshakeTestResult {
             val validationError = config.validate()
@@ -122,7 +183,8 @@ class WorkerWebSocketClient(
 
             val client = WorkerWebSocketClient(config)
             val resultDeferred = CompletableDeferred<HandshakeTestResult>()
-            val startNanos = System.nanoTime()
+            val totalStartNanos = System.nanoTime()
+            var wsOpenedNanos = totalStartNanos
 
             VpnStateHolder.log(
                 LogLevel.INFO,
@@ -133,16 +195,21 @@ class WorkerWebSocketClient(
             var session: WorkerTunnelSession? = null
             return try {
                 session = client.openTunnel(
-                    targetHost = "cp.cloudflare.com",
+                    targetHost = "www.gstatic.com",
                     targetPort = 80,
+                    onWsOpened = {
+                        wsOpenedNanos = System.nanoTime()
+                    },
                     onReady = {
-                        val elapsedMs = ((System.nanoTime() - startNanos) / 1_000_000L).toInt().coerceAtLeast(1)
+                        val nowNanos = System.nanoTime()
+                        val tunnelRttMs = ((nowNanos - wsOpenedNanos) / 1_000_000L).toInt().coerceAtLeast(1)
+                        val totalColdMs = ((nowNanos - totalStartNanos) / 1_000_000L).toInt().coerceAtLeast(1)
                         val resolved = client.lastResolvedIp
                         VpnStateHolder.log(
                             LogLevel.SUCCESS,
-                            "هندشیک موفق (ACK HMAC-SHA256 تایید شد) — ${elapsedMs}ms [$resolved]"
+                            "هندشیک موفق (HMAC-SHA256 OK) — پینگ تونل: ${tunnelRttMs}ms | اتصال کل: ${totalColdMs}ms [$resolved]"
                         )
-                        resultDeferred.complete(HandshakeTestResult.Success(elapsedMs, resolved))
+                        resultDeferred.complete(HandshakeTestResult.Success(tunnelRttMs, resolved))
                     },
                     onData = {},
                     onClosed = { reason ->
@@ -153,7 +220,7 @@ class WorkerWebSocketClient(
                         }
                     }
                 )
-                withTimeout(10_000L) {
+                withTimeout(8_000L) {
                     resultDeferred.await()
                 }
             } catch (e: Exception) {
@@ -170,6 +237,7 @@ class WorkerWebSocketClient(
 
 class WorkerTunnelSession(
     private val handshake: WorkerCrypto.InitHandshake,
+    private val onWsOpened: () -> Unit,
     private val onReady: () -> Unit,
     private val onData: (ByteArray) -> Unit,
     private val onClosed: (reason: String?) -> Unit,
@@ -179,7 +247,7 @@ class WorkerTunnelSession(
     private val lock = Any()
     private val pendingQueue = ArrayDeque<ByteArray>()
     private var pendingBytes = 0
-    private val maxQueueBytes = 2 * 1024 * 1024
+    private val maxQueueBytes = 4 * 1024 * 1024
 
     @Volatile
     private var webSocket: WebSocket? = null
@@ -250,6 +318,7 @@ class WorkerTunnelSession(
                 webSocket.close(1000, "cancelled")
                 return
             }
+            onWsOpened()
             val sent = webSocket.send(handshake.packet.toByteString())
             if (!sent) {
                 closeInternal("ارسال بسته Init ناموفق بود")
@@ -290,9 +359,7 @@ class WorkerTunnelSession(
             }
         }
 
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            // Worker only sends binary frames
-        }
+        override fun onMessage(webSocket: WebSocket, text: String) = Unit
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
             webSocket.close(1000, null)

@@ -26,6 +26,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 class WorkerVpnService : VpnService() {
@@ -70,7 +73,8 @@ class WorkerVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tunInterface: ParcelFileDescriptor? = null
     private var tunOutputStream: FileOutputStream? = null
-    private val tunWriteLock = Any()
+    private val tunWriteQueue = ArrayBlockingQueue<ByteArray>(4096)
+    private val tunRunning = AtomicBoolean(false)
 
     private var wsClient: WorkerWebSocketClient? = null
     private var tcpSessionManager: TcpSessionManager? = null
@@ -78,6 +82,7 @@ class WorkerVpnService : VpnService() {
     private var localSocks5Server: LocalSocks5Server? = null
 
     private var packetLoopJob: Job? = null
+    private var tunWriterJob: Job? = null
     private var statsJob: Job? = null
 
     private val totalUploadBytes = AtomicLong(0L)
@@ -140,7 +145,6 @@ class WorkerVpnService : VpnService() {
                 (endpoint.cleanIpHost?.let { " (Clean IP: $it)" } ?: " (Direct DNS)")
         )
 
-        // Verify real Worker WebSocket + HMAC-SHA256 ACK handshake before switching device routes!
         when (val verifyResult = WorkerWebSocketClient.testHandshake(config)) {
             is HandshakeTestResult.Failure -> {
                 VpnStateHolder.setState(VpnConnectionState.Error(verifyResult.reason))
@@ -162,9 +166,8 @@ class WorkerVpnService : VpnService() {
                 .setMtu(1500)
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
 
-            // Bypass our own app so OkHttp WebSocket connections to Worker / Clean IP never loop!
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (e: Exception) {
@@ -187,8 +190,12 @@ class WorkerVpnService : VpnService() {
 
             tunInterface = pfd
             tunOutputStream = FileOutputStream(pfd.fileDescriptor)
+            tunWriteQueue.clear()
+            tunRunning.set(true)
             totalUploadBytes.set(0L)
             totalDownloadBytes.set(0L)
+
+            startTunWriterLoop(tunOutputStream!!)
 
             val client = WorkerWebSocketClient(config)
             wsClient = client
@@ -196,18 +203,19 @@ class WorkerVpnService : VpnService() {
             val dnsHandler = DnsProxyHandler(
                 scope = serviceScope,
                 wsClient = client,
-                writePacketToTun = ::writeToTun,
+                writePacketToTun = ::enqueueTunWrite,
                 onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
                 onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
             )
             dnsProxyHandler = dnsHandler
+            dnsHandler.prewarm()
 
             val tcpManager = TcpSessionManager(
                 scope = serviceScope,
                 wsClient = client,
                 sniSniffingEnabled = config.sniSniffingEnabled,
                 lookupDomain = dnsHandler::lookupDomainForIp,
-                writePacketToTun = ::writeToTun,
+                writePacketToTun = ::enqueueTunWrite,
                 onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
                 onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
             )
@@ -241,7 +249,7 @@ class WorkerVpnService : VpnService() {
                 title = getString(R.string.notification_title_connected),
                 subtitle = "${config.profileName} • $resolvedClean"
             )
-            VpnStateHolder.log(LogLevel.SUCCESS, "تونل VPN فعال شد (MTU 1500 • DNS-over-Worker)")
+            VpnStateHolder.log(LogLevel.SUCCESS, "تونل پرسرعت فعال شد (Sliding-Window TCP • Cached DNS 8.8.8.8 • Fast QUIC Fallback)")
 
             startStatsTicker(socksAddress)
             startPacketLoop(pfd, tcpManager, dnsHandler)
@@ -255,6 +263,31 @@ class WorkerVpnService : VpnService() {
         }
     }
 
+    private fun startTunWriterLoop(output: FileOutputStream) {
+        tunWriterJob?.cancel()
+        tunWriterJob = serviceScope.launch(Dispatchers.IO) {
+            while (isActive && tunRunning.get()) {
+                val packet = try {
+                    tunWriteQueue.poll(100, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    break
+                } ?: continue
+
+                try {
+                    output.write(packet)
+                } catch (_: Exception) {
+                    if (!tunRunning.get()) break
+                }
+            }
+        }
+    }
+
+    private fun enqueueTunWrite(packet: ByteArray) {
+        if (!tunRunning.get()) return
+        // Non-blocking enqueue; if queue is saturated, TCP RTO/Fast-Retransmit cleanly recovers
+        tunWriteQueue.offer(packet)
+    }
+
     private fun startPacketLoop(
         pfd: ParcelFileDescriptor,
         tcpManager: TcpSessionManager,
@@ -263,7 +296,7 @@ class WorkerVpnService : VpnService() {
         packetLoopJob = serviceScope.launch(Dispatchers.IO) {
             val input = FileInputStream(pfd.fileDescriptor)
             val buffer = ByteArray(32_768)
-            while (isActive) {
+            while (isActive && tunRunning.get()) {
                 val readLen = try {
                     input.read(buffer)
                 } catch (_: Exception) {
@@ -281,6 +314,11 @@ class WorkerVpnService : VpnService() {
                         val udp = PacketUtils.parseUdpHeader(buffer, ip) ?: continue
                         if (udp.dstPort == 53) {
                             dnsHandler.handleUdpDnsPacket(ip, udp, buffer)
+                        } else {
+                            // Immediately reject UDP/443 (QUIC) & non-DNS UDP with ICMP Port Unreachable
+                            // so Chrome, YouTube, and Google apps instantly switch to TCP/HTTPS with 0ms stall
+                            val icmpUnreachable = PacketUtils.buildIpv4IcmpPortUnreachable(buffer, ip)
+                            enqueueTunWrite(icmpUnreachable)
                         }
                     }
                 }
@@ -313,18 +351,12 @@ class WorkerVpnService : VpnService() {
         }
     }
 
-    private fun writeToTun(packet: ByteArray) {
-        synchronized(tunWriteLock) {
-            try {
-                tunOutputStream?.write(packet)
-            } catch (_: Exception) {
-            }
-        }
-    }
-
     private fun stopTunnel(updateState: Boolean = true) {
+        tunRunning.set(false)
         packetLoopJob?.cancel()
         packetLoopJob = null
+        tunWriterJob?.cancel()
+        tunWriterJob = null
         statsJob?.cancel()
         statsJob = null
 
@@ -333,15 +365,16 @@ class WorkerVpnService : VpnService() {
 
         tcpSessionManager?.closeAll()
         tcpSessionManager = null
+
+        dnsProxyHandler?.close()
         dnsProxyHandler = null
 
         wsClient?.shutdown()
         wsClient = null
 
-        synchronized(tunWriteLock) {
-            try { tunOutputStream?.close() } catch (_: Exception) {}
-            tunOutputStream = null
-        }
+        tunWriteQueue.clear()
+        try { tunOutputStream?.close() } catch (_: Exception) {}
+        tunOutputStream = null
         try { tunInterface?.close() } catch (_: Exception) {}
         tunInterface = null
 

@@ -1,0 +1,6 @@
+{
+  "name": "EdgeTunnel",
+  "description": "کلاینت VPN اندروید برای اتصال به Cloudflare Worker با پشتیبانی از Worker URL، UUID و Clean IP",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

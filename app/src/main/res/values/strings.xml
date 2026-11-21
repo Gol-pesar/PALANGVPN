@@ -1,0 +1,67 @@
+<resources>
+    <string name="app_name">EdgeTunnel</string>
+    <string name="app_subtitle">کلاینت تونل ورکر رمزنگاری‌شده</string>
+
+    <!-- Navigation -->
+    <string name="nav_connect">اتصال</string>
+    <string name="nav_profiles">پروفایل‌ها</string>
+    <string name="nav_logs">گزارش و ابزار</string>
+
+    <!-- Connection States -->
+    <string name="status_disconnected">قطع شده</string>
+    <string name="status_connecting">در حال برقراری تونل…</string>
+    <string name="status_connected">متصل و ایمن</string>
+    <string name="status_error">خطا در اتصال</string>
+    <string name="tap_to_connect">برای اتصال لمس کنید</string>
+    <string name="tap_to_disconnect">برای قطع اتصال لمس کنید</string>
+
+    <!-- Fields -->
+    <string name="label_profile_name">نام پروفایل</string>
+    <string name="label_worker_url">Worker URL</string>
+    <string name="hint_worker_url">https://my-worker.workers.dev</string>
+    <string name="label_uuid">UUID</string>
+    <string name="hint_uuid">63ae8279-fafa-4dd0-b2ef-9d6a4ec3ffdd</string>
+    <string name="label_clean_ip">Clean IP (اختیاری)</string>
+    <string name="hint_clean_ip">104.16.132.229 یا 162.159.135.42:443</string>
+    <string name="helper_clean_ip">در صورت خالی بودن، اتصال مستقیم به دامنه ورکر انجام می‌شود</string>
+
+    <!-- Telemetry & Actions -->
+    <string name="metric_download">دانلود</string>
+    <string name="metric_upload">آپلود</string>
+    <string name="metric_tunnels">تونل فعال</string>
+    <string name="metric_latency">پینگ</string>
+    <string name="action_test_ping">تست اتصال</string>
+    <string name="action_testing">در حال تست…</string>
+    <string name="action_edit_config">ویرایش متغیرها</string>
+    <string name="action_add_profile">پروفایل جدید</string>
+    <string name="action_save">ذخیره پروفایل</string>
+    <string name="action_cancel">انصراف</string>
+    <string name="action_delete">حذف</string>
+    <string name="action_generate_uuid">تولید UUID تصادفی</string>
+    <string name="action_copy_config">کپی کانفیگ</string>
+    <string name="action_import_config">وارد کردن از کلیپ‌بورد</string>
+    <string name="action_clear_logs">پاک‌سازی</string>
+    <string name="action_copy_logs">کپی گزارش</string>
+
+    <!-- Settings & Tools -->
+    <string name="section_active_config">پیکربندی فعال ورکر</string>
+    <string name="section_tunnel_options">تنظیمات هسته تونل</string>
+    <string name="option_sni_sniffing">تشخیص هوشمند دامنه (TLS SNI)</string>
+    <string name="option_sni_sniffing_desc">ارسال نام دامنه واقعی به ورکر برای سازگاری بهتر با ProxyIP</string>
+    <string name="option_local_socks">پروکسی محلی SOCKS5</string>
+    <string name="option_local_socks_desc">فعال‌سازی سرور محلی روی 127.0.0.1:10808 هنگام اتصال</string>
+    <string name="protocol_spec_title">پروتکل ورکر</string>
+    <string name="protocol_spec_value">WSS • chat.v2 • XOR-16 • HMAC-SHA256</string>
+
+    <!-- Notifications & Errors -->
+    <string name="notification_channel_name">اتصال VPN</string>
+    <string name="notification_channel_desc">وضعیت فعال بودن تونل رمزنگاری‌شده EdgeTunnel</string>
+    <string name="notification_title_connected">EdgeTunnel متصل است</string>
+    <string name="notification_title_connecting">در حال اتصال به ورکر…</string>
+    <string name="notification_action_disconnect">قطع اتصال</string>
+    <string name="error_invalid_worker_url">لطفاً یک Worker URL معتبر وارد کنید (مثلاً https://worker.workers.dev)</string>
+    <string name="error_empty_uuid">مقدار UUID نمی‌تواند خالی باشد</string>
+    <string name="error_vpn_permission_denied">مجوز VPN توسط سیستم رد شد</string>
+    <string name="logs_empty_hint">هنوز گزارشی ثبت نشده است. برای مشاهده جزئیات هندشیک ورکر، تست اتصال یا VPN را فعال کنید.</string>
+    <string name="profiles_empty_hint">هنوز پروفایلی ذخیره نشده است. روی دکمه افزودن بزنید.</string>
+</resources>

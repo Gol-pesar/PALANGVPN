@@ -18,9 +18,14 @@ data class WorkerConfig(
     val workerUrl: String,
     val uuid: String,
     val cleanIp: String = "",
+    val fakeDnsEnabled: Boolean = true,
+    val localDnsEnabled: Boolean = true,
     val sniSniffingEnabled: Boolean = true,
     val localSocksEnabled: Boolean = true,
-    val localSocksPort: Int = 10808
+    val localSocksPort: Int = 10808,
+    val perAppEnabled: Boolean = false,
+    val perAppBypassMode: Boolean = true,
+    val perAppPackages: Set<String> = emptySet()
 ) {
     fun validate(): String? {
         if (uuid.trim().isEmpty()) return "مقدار UUID نمی‌تواند خالی باشد"

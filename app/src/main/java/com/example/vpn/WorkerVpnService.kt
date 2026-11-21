@@ -42,9 +42,14 @@ class WorkerVpnService : VpnService() {
         const val EXTRA_WORKER_URL = "extra_worker_url"
         const val EXTRA_UUID = "extra_uuid"
         const val EXTRA_CLEAN_IP = "extra_clean_ip"
+        const val EXTRA_FAKE_DNS = "extra_fake_dns"
+        const val EXTRA_LOCAL_DNS = "extra_local_dns"
         const val EXTRA_SNI_SNIFFING = "extra_sni_sniffing"
         const val EXTRA_LOCAL_SOCKS = "extra_local_socks"
         const val EXTRA_LOCAL_SOCKS_PORT = "extra_local_socks_port"
+        const val EXTRA_PER_APP_ENABLED = "extra_per_app_enabled"
+        const val EXTRA_PER_APP_BYPASS_MODE = "extra_per_app_bypass_mode"
+        const val EXTRA_PER_APP_PACKAGES = "extra_per_app_packages"
 
         private const val NOTIFICATION_CHANNEL_ID = "edgetunnel_vpn_channel"
         private const val NOTIFICATION_ID = 1042
@@ -57,9 +62,14 @@ class WorkerVpnService : VpnService() {
                 putExtra(EXTRA_WORKER_URL, config.workerUrl)
                 putExtra(EXTRA_UUID, config.uuid)
                 putExtra(EXTRA_CLEAN_IP, config.cleanIp)
+                putExtra(EXTRA_FAKE_DNS, config.fakeDnsEnabled)
+                putExtra(EXTRA_LOCAL_DNS, config.localDnsEnabled)
                 putExtra(EXTRA_SNI_SNIFFING, config.sniSniffingEnabled)
                 putExtra(EXTRA_LOCAL_SOCKS, config.localSocksEnabled)
                 putExtra(EXTRA_LOCAL_SOCKS_PORT, config.localSocksPort)
+                putExtra(EXTRA_PER_APP_ENABLED, config.perAppEnabled)
+                putExtra(EXTRA_PER_APP_BYPASS_MODE, config.perAppBypassMode)
+                putStringArrayListExtra(EXTRA_PER_APP_PACKAGES, ArrayList(config.perAppPackages))
             }
         }
 
@@ -97,15 +107,21 @@ class WorkerVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_CONNECT -> {
+                val perAppList = intent.getStringArrayListExtra(EXTRA_PER_APP_PACKAGES)?.toSet() ?: emptySet()
                 val config = WorkerConfig(
                     profileId = intent.getLongExtra(EXTRA_PROFILE_ID, 0L),
                     profileName = intent.getStringExtra(EXTRA_PROFILE_NAME).orEmpty().ifEmpty { "EdgeTunnel" },
                     workerUrl = intent.getStringExtra(EXTRA_WORKER_URL).orEmpty(),
                     uuid = intent.getStringExtra(EXTRA_UUID).orEmpty(),
                     cleanIp = intent.getStringExtra(EXTRA_CLEAN_IP).orEmpty(),
+                    fakeDnsEnabled = intent.getBooleanExtra(EXTRA_FAKE_DNS, true),
+                    localDnsEnabled = intent.getBooleanExtra(EXTRA_LOCAL_DNS, true),
                     sniSniffingEnabled = intent.getBooleanExtra(EXTRA_SNI_SNIFFING, true),
                     localSocksEnabled = intent.getBooleanExtra(EXTRA_LOCAL_SOCKS, true),
-                    localSocksPort = intent.getIntExtra(EXTRA_LOCAL_SOCKS_PORT, 10808)
+                    localSocksPort = intent.getIntExtra(EXTRA_LOCAL_SOCKS_PORT, 10808),
+                    perAppEnabled = intent.getBooleanExtra(EXTRA_PER_APP_ENABLED, false),
+                    perAppBypassMode = intent.getBooleanExtra(EXTRA_PER_APP_BYPASS_MODE, true),
+                    perAppPackages = perAppList
                 )
                 startForegroundCompat(
                     title = getString(R.string.notification_title_connecting),
@@ -168,11 +184,8 @@ class WorkerVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("8.8.8.8")
 
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (e: Exception) {
-                VpnStateHolder.log(LogLevel.WARN, "خطا در استثنا کردن اپلیکیشن: ${e.message}")
-            }
+            // Apply Per-App Proxy & strictly enforce Self-Bypass so EdgeTunnel NEVER loops into itself!
+            applyPerAppRoutingAndSelfBypass(builder, config)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -199,10 +212,14 @@ class WorkerVpnService : VpnService() {
 
             val client = WorkerWebSocketClient(config)
             wsClient = client
+            // Pre-warm 4 idle TLS+WebSocket connections immediately for 0ms checkout!
+            client.startWarmPool(serviceScope)
 
             val dnsHandler = DnsProxyHandler(
                 scope = serviceScope,
                 wsClient = client,
+                fakeDnsEnabled = config.fakeDnsEnabled,
+                localDnsEnabled = config.localDnsEnabled,
                 writePacketToTun = ::enqueueTunWrite,
                 onBytesSent = { totalUploadBytes.addAndGet(it.toLong()) },
                 onBytesReceived = { totalDownloadBytes.addAndGet(it.toLong()) }
@@ -249,7 +266,17 @@ class WorkerVpnService : VpnService() {
                 title = getString(R.string.notification_title_connected),
                 subtitle = "${config.profileName} • $resolvedClean"
             )
-            VpnStateHolder.log(LogLevel.SUCCESS, "تونل پرسرعت فعال شد (Sliding-Window TCP • Cached DNS 8.8.8.8 • Fast QUIC Fallback)")
+
+            val dnsSummary = buildList {
+                if (config.fakeDnsEnabled) add("FakeDNS")
+                if (config.localDnsEnabled) add("LocalDNS(DoH)")
+                if (isEmpty()) add("RemoteDNS")
+            }.joinToString("+")
+
+            VpnStateHolder.log(
+                LogLevel.SUCCESS,
+                "تونل فعال شد (WarmPool 0-RTT • NewReno TCP • $dnsSummary • Self-Bypass)"
+            )
 
             startStatsTicker(socksAddress)
             startPacketLoop(pfd, tcpManager, dnsHandler)
@@ -260,6 +287,59 @@ class WorkerVpnService : VpnService() {
             stopTunnel(updateState = false)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    /**
+     * Strictly bypasses this app itself (Self-Bypass) in every configuration and applies
+     * Per-App Proxy rules (either Disallowed/Bypass list or Allowed-Only list).
+     */
+    private fun applyPerAppRoutingAndSelfBypass(builder: Builder, config: WorkerConfig) {
+        val selfPkg = packageName
+        val filteredPackages = config.perAppPackages
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != selfPkg }
+
+        if (config.perAppEnabled && !config.perAppBypassMode && filteredPackages.isNotEmpty()) {
+            // Allowed-Only mode: route ONLY selected apps; selfPkg is strictly excluded -> auto-bypassed!
+            var added = 0
+            for (pkg in filteredPackages) {
+                try {
+                    builder.addAllowedApplication(pkg)
+                    added++
+                } catch (_: Exception) {
+                }
+            }
+            if (added > 0) {
+                VpnStateHolder.log(
+                    LogLevel.INFO,
+                    "Per-App Proxy (فقط انتخابی): $added برنامه از تونل عبور می‌کند (Self-Bypass فعال)"
+                )
+                return
+            }
+        }
+
+        // Default or Bypass mode: ALWAYS disallow selfPkg first!
+        try {
+            builder.addDisallowedApplication(selfPkg)
+            VpnStateHolder.log(LogLevel.INFO, "بایپس خودکار اپلیکیشن (Self-Bypass): $selfPkg")
+        } catch (e: Exception) {
+            VpnStateHolder.log(LogLevel.WARN, "خطا در Self-Bypass: ${e.message}")
+        }
+
+        if (config.perAppEnabled && config.perAppBypassMode && filteredPackages.isNotEmpty()) {
+            var bypassed = 0
+            for (pkg in filteredPackages) {
+                try {
+                    builder.addDisallowedApplication(pkg)
+                    bypassed++
+                } catch (_: Exception) {
+                }
+            }
+            VpnStateHolder.log(
+                LogLevel.INFO,
+                "Per-App Proxy (حالت بایپس): $bypassed برنامه + خود اپلیکیشن مستثنا شدند"
+            )
         }
     }
 
@@ -284,7 +364,6 @@ class WorkerVpnService : VpnService() {
 
     private fun enqueueTunWrite(packet: ByteArray) {
         if (!tunRunning.get()) return
-        // Non-blocking enqueue; if queue is saturated, TCP RTO/Fast-Retransmit cleanly recovers
         tunWriteQueue.offer(packet)
     }
 
@@ -315,8 +394,7 @@ class WorkerVpnService : VpnService() {
                         if (udp.dstPort == 53) {
                             dnsHandler.handleUdpDnsPacket(ip, udp, buffer)
                         } else {
-                            // Immediately reject UDP/443 (QUIC) & non-DNS UDP with ICMP Port Unreachable
-                            // so Chrome, YouTube, and Google apps instantly switch to TCP/HTTPS with 0ms stall
+                            // Instantly reject UDP/443 (QUIC) & non-DNS UDP with ICMP Port Unreachable
                             val icmpUnreachable = PacketUtils.buildIpv4IcmpPortUnreachable(buffer, ip)
                             enqueueTunWrite(icmpUnreachable)
                         }

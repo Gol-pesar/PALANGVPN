@@ -13,20 +13,19 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * High-speed encrypted DNS proxy over a persistent, multiplexed Worker WebSocket tunnel
- * to Google Public DNS (8.8.8.8:53 / 8.8.4.4:53 — never 1.1.1.1 which Cloudflare Workers
- * block on direct connect!).
- *
- * Optimizations:
- * - Instant (<0.2ms) empty NOERROR replies for AAAA (Type 28) & HTTPS/SVCB (Type 65) on IPv4 TUN
- * - TTL-aware in-memory DNS response cache (<0.5ms hits)
- * - In-flight query deduplication
- * - Persistent multiplexed TCP DNS tunnel (RFC 7766) eliminating per-query TLS/WS handshakes
- * - IPv4 -> Domain cache so TcpSessionManager dials Worker with true hostnames immediately on SYN
+ * High-speed multi-mode DNS engine for the VPN TUN interface:
+ * 1. Fake DNS (when enabled): <0.1ms synthetic 198.18.0.0/15 A-record replies with zero network RTT!
+ *    TcpSessionManager resolves the fake IP back to the real domain and dials Worker natively.
+ * 2. Local DNS (when enabled): In-app TTL-cached resolver using HTTP/2 DoH over port 443
+ *    (Cloudflare DoH via Clean IP -> Google DoH fallback -> persistent Worker TCP DNS fallback),
+ *    completely immune to Worker port-53 restrictions.
+ * 3. Instant empty NOERROR for AAAA (Type 28) & HTTPS/SVCB (Type 65) on IPv4 TUN.
  */
 class DnsProxyHandler(
     private val scope: CoroutineScope,
     private val wsClient: WorkerWebSocketClient,
+    private val fakeDnsEnabled: Boolean,
+    private val localDnsEnabled: Boolean,
     private val writePacketToTun: (ByteArray) -> Unit,
     private val onBytesSent: (Int) -> Unit,
     private val onBytesReceived: (Int) -> Unit
@@ -35,6 +34,7 @@ class DnsProxyHandler(
     private data class CachedAnswer(val wireResponse: ByteArray, val expiresAtMs: Long)
     private data class ParsedQuestion(val domain: String, val qtype: Int, val questionEndOffset: Int)
 
+    private val fakeDnsPool = FakeDnsPool(maxEntries = 4096)
     private val upstreamServers = listOf("8.8.8.8", "8.8.4.4", "9.9.9.9")
     private val serverRotation = AtomicInteger(0)
     private val muxTxIdGenerator = AtomicInteger(1)
@@ -53,7 +53,6 @@ class DnsProxyHandler(
 
     private val inFlightDedup = ConcurrentHashMap<CacheKey, CompletableDeferred<ByteArray?>>()
 
-    // Persistent TCP DNS tunnel state
     private val tunnelLock = Any()
     private var persistentTunnel: WorkerTunnelSession? = null
     private val streamBuffer = ByteArrayOutputStream()
@@ -63,12 +62,17 @@ class DnsProxyHandler(
     private var closed = false
 
     fun prewarm() {
-        scope.launch(Dispatchers.IO) {
-            ensurePersistentTunnel()
+        if (!fakeDnsEnabled && !localDnsEnabled) {
+            scope.launch(Dispatchers.IO) { ensurePersistentTunnel() }
         }
     }
 
-    fun lookupDomainForIp(ip: Int): String? = ipToDomainCache[ip]
+    fun lookupDomainForIp(ip: Int): String? {
+        if (fakeDnsEnabled) {
+            fakeDnsPool.lookupDomain(ip)?.let { return it }
+        }
+        return ipToDomainCache[ip]
+    }
 
     fun handleUdpDnsPacket(
         ip: PacketUtils.Ipv4Header,
@@ -79,15 +83,21 @@ class DnsProxyHandler(
         val dnsQuery = rawPacket.copyOfRange(udp.payloadOffset, udp.payloadOffset + udp.payloadLength)
         val question = parseQuestion(dnsQuery)
 
-        // Fast-path: IPv4-only TUN does not route IPv6 (AAAA=28) or QUIC HTTPS/SVCB (65).
-        // Returning empty NOERROR immediately saves >60% of DNS queries and stops QUIC/IPv6 stalls!
+        // 1) IPv4-only TUN: instantly suppress AAAA (28) & HTTPS/SVCB (65) to stop IPv6/QUIC stalls
         if (question != null && (question.qtype == 28 || question.qtype == 65)) {
-            val emptyReply = buildEmptyNoErrorResponse(dnsQuery, question.questionEndOffset)
-            sendUdpReply(ip, udp, emptyReply)
+            sendUdpReply(ip, udp, buildEmptyNoErrorResponse(dnsQuery, question.questionEndOffset))
             return
         }
 
-        // Fast-path: TTL-aware cache hit (<0.5ms)
+        // 2) Fake DNS fast-path: <0.1ms synthetic 198.18.x.y answer for IPv4 A (Type 1) queries!
+        if (fakeDnsEnabled && question != null && question.qtype == 1) {
+            val fakeIp = fakeDnsPool.allocateOrGet(question.domain)
+            val fakeResponse = buildFakeAResponse(dnsQuery, question.questionEndOffset, fakeIp)
+            sendUdpReply(ip, udp, fakeResponse)
+            return
+        }
+
+        // 3) TTL-aware cache hit (<0.5ms)
         if (question != null) {
             val cacheKey = CacheKey(question.domain.lowercase(), question.qtype)
             val cached = dnsResponseCache[cacheKey]
@@ -125,15 +135,11 @@ class DnsProxyHandler(
     ): ByteArray? {
         val cacheKey = CacheKey(question.domain.lowercase(), question.qtype)
         val existing = inFlightDedup[cacheKey]
-        if (existing != null) {
-            return existing.await()
-        }
+        if (existing != null) return existing.await()
 
         val mine = CompletableDeferred<ByteArray?>()
         val raced = inFlightDedup.putIfAbsent(cacheKey, mine)
-        if (raced != null) {
-            return raced.await()
-        }
+        if (raced != null) return raced.await()
 
         return try {
             val result = resolveUpstream(dnsQuery)
@@ -158,13 +164,22 @@ class DnsProxyHandler(
     }
 
     private suspend fun resolveUpstream(dnsQuery: ByteArray): ByteArray? {
-        // Attempt 1: Persistent multiplexed Worker TCP DNS tunnel
-        val firstTry = queryOverPersistentTunnel(dnsQuery, timeoutMs = 3_000L)
+        // When Local DNS is enabled, resolve via fast HTTP/2 DoH on port 443 first (immune to port 53 blocks!)
+        if (localDnsEnabled) {
+            val dohResp = wsClient.queryLocalDoh(dnsQuery)
+            if (dohResp != null) {
+                onBytesSent(dnsQuery.size)
+                onBytesReceived(dohResp.size)
+                return dohResp
+            }
+        }
+
+        // Fallback / Remote Worker TCP DNS (8.8.8.8:53)
+        val firstTry = queryOverPersistentTunnel(dnsQuery, timeoutMs = 2_500L)
         if (firstTry != null) return firstTry
 
-        // Attempt 2: Reconnect persistent tunnel on next upstream DNS server and retry once
         resetPersistentTunnel()
-        return queryOverPersistentTunnel(dnsQuery, timeoutMs = 4_000L)
+        return queryOverPersistentTunnel(dnsQuery, timeoutMs = 3_500L)
     }
 
     private suspend fun queryOverPersistentTunnel(dnsQuery: ByteArray, timeoutMs: Long): ByteArray? {
@@ -179,7 +194,6 @@ class DnsProxyHandler(
         framed[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
         framed[1] = (dnsQuery.size and 0xFF).toByte()
         System.arraycopy(dnsQuery, 0, framed, 2, dnsQuery.size)
-        // Stamp internal multiplexed transaction ID
         framed[2] = ((muxId ushr 8) and 0xFF).toByte()
         framed[3] = (muxId and 0xFF).toByte()
 
@@ -224,7 +238,7 @@ class DnsProxyHandler(
         synchronized(tunnelLock) {
             if (persistentTunnel !== source) return
             streamBuffer.write(chunk)
-            var bytes = streamBuffer.toByteArray()
+            val bytes = streamBuffer.toByteArray()
             var offset = 0
             while (offset + 2 <= bytes.size) {
                 val frameLen = PacketUtils.readUInt16(bytes, offset)
@@ -279,6 +293,7 @@ class DnsProxyHandler(
     fun close() {
         closed = true
         resetPersistentTunnel()
+        fakeDnsPool.clear()
         pendingMuxQueries.values.forEach { it.complete(null) }
         pendingMuxQueries.clear()
         inFlightDedup.values.forEach { it.complete(null) }
@@ -300,15 +315,45 @@ class DnsProxyHandler(
         writePacketToTun(responsePacket)
     }
 
+    /**
+     * Constructs a valid RFC 1035 DNS A-record response pointing to the allocated Fake IPv4
+     * with short TTL (10s) so apps never persist synthetic IPs after VPN disconnect.
+     */
+    private fun buildFakeAResponse(query: ByteArray, questionEndOffset: Int, fakeIp: Int): ByteArray {
+        val qEnd = questionEndOffset.coerceIn(12, query.size)
+        val out = ByteArray(qEnd + 16)
+        System.arraycopy(query, 0, out, 0, qEnd)
+
+        val rd = query[2].toInt() and 0x01
+        out[2] = (0x80 or rd).toByte() // QR=1, preserve RD
+        out[3] = 0x80.toByte()         // RA=1, RCODE=0 (NOERROR)
+        // QDCOUNT = 1, ANCOUNT = 1, NSCOUNT = 0, ARCOUNT = 0
+        out[4] = 0; out[5] = 1
+        out[6] = 0; out[7] = 1
+        out[8] = 0; out[9] = 0
+        out[10] = 0; out[11] = 0
+
+        // Answer RR: pointer to offset 12 (0xC00C), Type A (1), Class IN (1), TTL 10s, RDLENGTH 4, IPv4
+        var p = qEnd
+        out[p++] = 0xC0.toByte(); out[p++] = 0x0C.toByte()
+        out[p++] = 0x00; out[p++] = 0x01 // Type A
+        out[p++] = 0x00; out[p++] = 0x01 // Class IN
+        out[p++] = 0x00; out[p++] = 0x00; out[p++] = 0x00; out[p++] = 10 // TTL = 10s
+        out[p++] = 0x00; out[p++] = 0x04 // RDLENGTH = 4
+        out[p++] = ((fakeIp ushr 24) and 0xFF).toByte()
+        out[p++] = ((fakeIp ushr 16) and 0xFF).toByte()
+        out[p++] = ((fakeIp ushr 8) and 0xFF).toByte()
+        out[p] = (fakeIp and 0xFF).toByte()
+        return out
+    }
+
     private fun buildEmptyNoErrorResponse(query: ByteArray, questionEndOffset: Int): ByteArray {
         val qEnd = questionEndOffset.coerceIn(12, query.size)
         val out = ByteArray(qEnd)
         System.arraycopy(query, 0, out, 0, qEnd)
-        // Flags: QR=1 (response), preserve RD bit, set RA=1, RCODE=0 (NOERROR)
         val rd = query[2].toInt() and 0x01
         out[2] = (0x80 or rd).toByte()
         out[3] = 0x80.toByte()
-        // QDCOUNT = 1, ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0
         out[4] = 0; out[5] = 1
         out[6] = 0; out[7] = 0
         out[8] = 0; out[9] = 0

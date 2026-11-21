@@ -292,4 +292,19 @@ class WorkerProtocolTest {
         assertTrue(PacketUtils.seqDiff(0x00000005L, 0xFFFFFFFBL) == 10L)
         assertTrue(PacketUtils.seqDiff(0xFFFFFFFBL, 0x00000005L) == -10L)
     }
+
+    @Test
+    fun fakeDnsPool_allocatesAndResolvesRfc2544Addresses() {
+        val pool = com.example.vpn.FakeDnsPool(maxEntries = 4)
+        val ipGoogle = pool.allocateOrGet("www.google.com")
+        val ipGoogleAgain = pool.allocateOrGet("WWW.GOOGLE.COM.")
+        val ipYoutube = pool.allocateOrGet("youtube.com")
+
+        assertEquals(ipGoogle, ipGoogleAgain)
+        assertTrue(com.example.vpn.FakeDnsPool.isFakeIp(ipGoogle))
+        assertTrue(com.example.vpn.FakeDnsPool.isFakeIp(ipYoutube))
+        assertFalse(com.example.vpn.FakeDnsPool.isFakeIp(0x08080808))
+        assertEquals("www.google.com", pool.lookupDomain(ipGoogle))
+        assertEquals("youtube.com", pool.lookupDomain(ipYoutube))
+    }
 }

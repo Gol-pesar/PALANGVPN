@@ -24,16 +24,12 @@ data class TcpFlowKey(
 )
 
 /**
- * Reliable, high-throughput user-space TCP engine bridging Android TUN IPv4/TCP flows
- * to Worker WebSocket tunnels.
- *
- * Key reliability & speed features:
- * - RFC 7323 Window Scaling & MSS (1360) negotiation on SYN-ACK
- * - Sliding-window flow control respecting client advertised window (prevents TUN overflow drops)
- * - Unacknowledged segment queue with 3-dup-ACK Fast Retransmit and RTO timer (eliminates stalls)
- * - Out-of-order client segment reassembly & contiguous coalescing (fewer WebSocket frames)
- * - Zero-delay eager Worker dialing whenever DNS cache already knows the destination domain
- * - Clean half-close handling so trailing response bytes flush before FIN-ACK
+ * High-throughput, stall-free user-space TCP engine with:
+ * - RFC 7323 Window Scaling & MSS (1360)
+ * - TCP Slow-Start + Congestion Window (cwnd) + NewReno Fast Recovery (prevents TUN overflow stalls!)
+ * - 180ms fast RTO timer + 3-dup-ACK Fast Retransmit
+ * - Fake DNS instant domain resolution + 0-RTT pre-warmed Worker WebSocket dialing on SYN
+ * - Out-of-order client segment reassembly
  */
 class TcpSessionManager(
     private val scope: CoroutineScope,
@@ -46,12 +42,14 @@ class TcpSessionManager(
 ) {
     companion object {
         private const val DEFAULT_MSS = PacketUtils.DEFAULT_MSS
-        private const val MAX_IN_FLIGHT_BYTES = 196_608 // 192 KB sliding window cap
+        private const val INITIAL_CWND_SEGMENTS = 16
+        private const val INITIAL_SSTHRESH = 131_072   // 128 KB
+        private const val MAX_CWND_BYTES = 524_288     // 512 KB
         private const val IDLE_TIMEOUT_MS = 90_000L
-        private const val SNI_WAIT_TIMEOUT_MS = 80L
-        private const val RETRANSMIT_TICK_MS = 120L
-        private const val BASE_RTO_MS = 300L
-        private const val MAX_RTO_MS = 2_400L
+        private const val SNI_WAIT_TIMEOUT_MS = 65L
+        private const val RETRANSMIT_TICK_MS = 80L
+        private const val BASE_RTO_MS = 180L
+        private const val MAX_RTO_MS = 1_600L
         private const val MAX_RETRIES = 8
         private const val MAX_OOO_SEGMENTS = 32
     }
@@ -77,7 +75,7 @@ class TcpSessionManager(
             delay(RETRANSMIT_TICK_MS)
             val now = System.currentTimeMillis()
             idleTickCounter++
-            val checkIdle = idleTickCounter >= 120 // ~15 seconds
+            val checkIdle = idleTickCounter >= 180 // ~14.4 seconds
 
             val iterator = sessions.entries.iterator()
             while (iterator.hasNext()) {
@@ -178,16 +176,20 @@ class TcpSessionManager(
         private var serverNextSeq: Long = initialServerSeq
         private var serverUnackedSeq: Long = initialServerSeq
         private var clientWindowBytes: Int = (initialClientWindow shl (clientWindowScaleShift ?: 0)).coerceAtLeast(32_768)
+
+        // NewReno congestion control (prevents TUN burst overflow & recovers multiple losses in 1 RTT)
+        private var cwndBytes: Int = INITIAL_CWND_SEGMENTS * clientMss
+        private var ssthreshBytes: Int = INITIAL_SSTHRESH
+        private var inRecovery: Boolean = false
+        private var recoverSeq: Long = initialServerSeq
         private var dupAckCount: Int = 0
         private var synAcked: Boolean = false
 
-        // Worker -> TUN sliding window & retransmission buffers
         private val pendingSendQueue = ArrayDeque<ByteArray>()
         private var pendingHeadOffset = 0
         private val unackedSegments = ArrayDeque<SentSegment>()
         private var inFlightBytes = 0
 
-        // TUN -> Worker out-of-order reassembly buffer
         private val oooClientSegments = TreeMap<Long, ByteArray> { a, b ->
             PacketUtils.seqDiff(a, b).compareTo(0L)
         }
@@ -231,17 +233,27 @@ class TcpSessionManager(
                 writePacketToTun(synAck)
             }
 
+            // Look up Fake DNS or real DNS cache first — if found, dial Worker IMMEDIATELY on SYN!
             val cachedDomain = lookupDomain(key.dstIp)
-            val shouldSniff = sniSniffingEnabled &&
+            val isUnmappedFakeIp = cachedDomain == null && FakeDnsPool.isFakeIp(key.dstIp)
+            val shouldSniff = (sniSniffingEnabled || isUnmappedFakeIp) &&
                 cachedDomain == null &&
                 (key.dstPort == 443 || key.dstPort == 80 || key.dstPort == 8443 || key.dstPort == 8080)
 
             if (!shouldSniff) {
+                if (isUnmappedFakeIp) {
+                    // Fake IP expired from pool and no SNI port; reset cleanly so app re-queries DNS
+                    sessions.remove(key)
+                    close(sendReset = true)
+                    return
+                }
                 startWorkerDial(cachedDomain ?: PacketUtils.ipIntToString(key.dstIp), initialPayload = null)
             } else {
                 sniWaitJob = scope.launch(Dispatchers.IO) {
                     delay(SNI_WAIT_TIMEOUT_MS)
-                    startWorkerDial(PacketUtils.ipIntToString(key.dstIp), initialPayload = null)
+                    if (!isUnmappedFakeIp) {
+                        startWorkerDial(PacketUtils.ipIntToString(key.dstIp), initialPayload = null)
+                    }
                 }
             }
         }
@@ -261,13 +273,35 @@ class TcpSessionManager(
                     dupAckCount = 0
                     synAcked = true
 
+                    var newlyAckedBytes = 0
                     while (unackedSegments.isNotEmpty()) {
                         val head = unackedSegments.first()
                         if (PacketUtils.seqDiff(ackNum, head.seqEnd) >= 0) {
                             unackedSegments.removeFirst()
                             inFlightBytes = (inFlightBytes - head.payload.size).coerceAtLeast(0)
+                            newlyAckedBytes += head.payload.size
                         } else {
                             break
+                        }
+                    }
+
+                    // NewReno partial-ACK handling: if still in recovery and more lost segments remain,
+                    // immediately retransmit the next missing head instead of waiting for RTO!
+                    if (inRecovery) {
+                        if (PacketUtils.seqDiff(ackNum, recoverSeq) >= 0) {
+                            inRecovery = false
+                            cwndBytes = ssthreshBytes.coerceAtLeast(8 * clientMss)
+                        } else if (unackedSegments.isNotEmpty()) {
+                            retransmitSegmentLocked(unackedSegments.first(), System.currentTimeMillis())
+                        }
+                    } else if (newlyAckedBytes > 0) {
+                        // Slow Start -> Congestion Avoidance
+                        cwndBytes = if (cwndBytes < ssthreshBytes) {
+                            (cwndBytes + newlyAckedBytes).coerceAtMost(MAX_CWND_BYTES)
+                        } else {
+                            val increment = ((clientMss.toLong() * newlyAckedBytes) / cwndBytes.coerceAtLeast(clientMss))
+                                .toInt().coerceAtLeast(1)
+                            (cwndBytes + increment).coerceAtMost(MAX_CWND_BYTES)
                         }
                     }
 
@@ -277,13 +311,18 @@ class TcpSessionManager(
                         shouldCleanup = true
                     }
                 } else if (advance == 0L && !hasPayload && unackedSegments.isNotEmpty()) {
-                    // Track duplicate ACKs for Fast Retransmit (RFC 5681)
                     dupAckCount++
                     if (dupAckCount == 3) {
+                        ssthreshBytes = (cwndBytes / 2).coerceAtLeast(8 * clientMss)
+                        cwndBytes = ssthreshBytes + 3 * clientMss
+                        inRecovery = true
+                        recoverSeq = serverNextSeq
                         retransmitSegmentLocked(unackedSegments.first(), System.currentTimeMillis())
+                    } else if (dupAckCount > 3 && inRecovery) {
+                        cwndBytes = (cwndBytes + clientMss).coerceAtMost(MAX_CWND_BYTES)
+                        pumpSendQueueLocked()
                     }
                 } else if (clientWindowBytes > 0 && pendingSendQueue.isNotEmpty()) {
-                    // Window update opened space
                     pumpSendQueueLocked()
                 }
             }
@@ -301,13 +340,11 @@ class TcpSessionManager(
 
                 when {
                     diff == 0L -> {
-                        // In-order fast path
                         clientNextSeq = (clientNextSeq + payload.size.toLong()) and 0xFFFFFFFFL
                         contiguousToForward = drainOutOfOrderLocked(payload)
                         sendAckOnlyLocked()
                     }
                     diff < 0L -> {
-                        // Retransmission or partial overlap
                         val overlap = (-diff).toInt()
                         if (overlap < payload.size) {
                             val freshPart = payload.copyOfRange(overlap, payload.size)
@@ -317,7 +354,6 @@ class TcpSessionManager(
                         sendAckOnlyLocked()
                     }
                     else -> {
-                        // Out-of-order future segment: buffer up to MAX_OOO_SEGMENTS
                         if (oooClientSegments.size < MAX_OOO_SEGMENTS && diff < 262_144L) {
                             val existing = oooClientSegments[seqNum]
                             if (existing == null || payload.size > existing.size) {
@@ -331,10 +367,17 @@ class TcpSessionManager(
 
             val data = contiguousToForward ?: return
             if (!dialStarted) {
-                val sniffedHost = if (sniSniffingEnabled) {
+                val sniffedHost = if (sniSniffingEnabled || FakeDnsPool.isFakeIp(key.dstIp)) {
                     PacketUtils.extractTlsSni(data) ?: PacketUtils.extractHttpHost(data)
                 } else null
-                val targetHost = sniffedHost ?: lookupDomain(key.dstIp) ?: PacketUtils.ipIntToString(key.dstIp)
+                val targetHost = sniffedHost ?: lookupDomain(key.dstIp) ?: run {
+                    if (FakeDnsPool.isFakeIp(key.dstIp)) {
+                        sessions.remove(key)
+                        close(sendReset = true)
+                        return
+                    }
+                    PacketUtils.ipIntToString(key.dstIp)
+                }
                 startWorkerDial(targetHost, initialPayload = data)
             } else {
                 tunnelSession?.send(data)
@@ -377,10 +420,6 @@ class TcpSessionManager(
                     sendAckOnlyLocked()
                     if (remoteClosed && pendingSendQueue.isEmpty() && unackedSegments.isEmpty()) {
                         shouldCloseNow = true
-                    } else if (!remoteClosed) {
-                        // Client finished sending; if server already sent nothing pending, close cleanly
-                        // after remote finishes or immediately if nothing is pending
-                        shouldCloseNow = false
                     }
                 }
             }
@@ -460,7 +499,7 @@ class TcpSessionManager(
 
         private fun pumpSendQueueLocked() {
             if (closed || !synAcked) return
-            val effectiveWindow = minOf(clientWindowBytes.coerceAtLeast(clientMss), MAX_IN_FLIGHT_BYTES)
+            val effectiveWindow = minOf(clientWindowBytes.coerceAtLeast(clientMss), cwndBytes)
             val now = System.currentTimeMillis()
 
             while (pendingSendQueue.isNotEmpty() && inFlightBytes < effectiveWindow) {
@@ -516,7 +555,6 @@ class TcpSessionManager(
                 writePacketToTun(packet)
             }
 
-            // If remote closed cleanly and all data has been pushed, send FIN|ACK
             if (remoteClosed && !serverFinSent && pendingSendQueue.isEmpty()) {
                 serverFinSent = true
                 val seqStart = serverNextSeq
@@ -555,7 +593,6 @@ class TcpSessionManager(
                     return false
                 }
                 if (unackedSegments.isEmpty()) {
-                    // Clean up completed half-closed flows
                     if (serverFinSent && (clientFinReceived || now - lastActivityMs.get() > 10_000L)) {
                         return false
                     }
@@ -567,6 +604,10 @@ class TcpSessionManager(
                     if (head.retries >= MAX_RETRIES) {
                         return false
                     }
+                    // RTO backoff on cwnd
+                    ssthreshBytes = (cwndBytes / 2).coerceAtLeast(8 * clientMss)
+                    cwndBytes = 8 * clientMss
+                    inRecovery = false
                     retransmitSegmentLocked(head, now)
                 }
                 return true

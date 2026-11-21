@@ -60,6 +60,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.MainViewModel
+import com.example.ui.components.PerAppProxySheet
 import com.example.ui.components.ProfileEditorSheet
 import com.example.ui.screens.ConnectScreen
 import com.example.ui.screens.LogsToolsScreen
@@ -110,6 +111,9 @@ private fun EdgeTunnelApp(
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val testingProfileIds by viewModel.testingProfileIds.collectAsStateWithLifecycle()
     val editorState by viewModel.editorState.collectAsStateWithLifecycle()
+    val perAppSheetOpen by viewModel.perAppSheetOpen.collectAsStateWithLifecycle()
+    val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val loadingApps by viewModel.loadingApps.collectAsStateWithLifecycle()
 
     var currentTab by rememberSaveable { mutableStateOf(AppTab.CONNECT) }
     var pendingConfigToStart by remember { mutableStateOf<WorkerConfig?>(null) }
@@ -187,7 +191,6 @@ private fun EdgeTunnelApp(
         proceedWithVpnConsent(config)
     }
 
-    // Handle system back button cleanly from non-home tabs
     BackHandler(enabled = currentTab != AppTab.CONNECT) {
         currentTab = AppTab.CONNECT
     }
@@ -281,6 +284,10 @@ private fun EdgeTunnelApp(
                         AppTab.LOGS -> LogsToolsScreen(
                             settings = settings,
                             logs = logs,
+                            onFakeDnsChanged = viewModel::setFakeDnsEnabled,
+                            onLocalDnsChanged = viewModel::setLocalDnsEnabled,
+                            onPerAppEnabledChanged = viewModel::setPerAppEnabled,
+                            onOpenPerAppPicker = viewModel::openPerAppPicker,
                             onSniSniffingChanged = viewModel::setSniSniffingEnabled,
                             onLocalSocksChanged = viewModel::setLocalSocksEnabled,
                             onClearLogs = viewModel::clearLogs,
@@ -302,6 +309,19 @@ private fun EdgeTunnelApp(
             onGenerateUuid = viewModel::generateRandomUuidInEditor,
             onSave = viewModel::saveEditorProfile,
             onDismiss = viewModel::closeEditor
+        )
+    }
+
+    if (perAppSheetOpen) {
+        PerAppProxySheet(
+            apps = installedApps,
+            isLoading = loadingApps,
+            bypassMode = settings.perAppBypassMode,
+            selectedPackages = settings.perAppPackages,
+            onBypassModeChanged = viewModel::setPerAppBypassMode,
+            onTogglePackage = viewModel::togglePerAppPackage,
+            onClearSelection = viewModel::clearPerAppSelection,
+            onDismiss = viewModel::closePerAppPicker
         )
     }
 }

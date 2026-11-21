@@ -1,6 +1,9 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Intent
+import android.content.pm.PackageManager
+import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.AppDatabase
@@ -8,6 +11,7 @@ import com.example.data.ProfileRepository
 import com.example.data.ServerProfileEntity
 import com.example.data.SettingsDataStore
 import com.example.data.TunnelSettings
+import com.example.ui.components.InstalledAppInfo
 import com.example.vpn.LogLevel
 import com.example.vpn.VpnConnectionState
 import com.example.vpn.VpnLogEntry
@@ -74,6 +78,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _editorState = MutableStateFlow(ProfileEditorState())
     val editorState: StateFlow<ProfileEditorState> = _editorState.asStateFlow()
 
+    private val _perAppSheetOpen = MutableStateFlow(false)
+    val perAppSheetOpen: StateFlow<Boolean> = _perAppSheetOpen.asStateFlow()
+
+    private val _installedApps = MutableStateFlow<List<InstalledAppInfo>>(emptyList())
+    val installedApps: StateFlow<List<InstalledAppInfo>> = _installedApps.asStateFlow()
+
+    private val _loadingApps = MutableStateFlow(false)
+    val loadingApps: StateFlow<Boolean> = _loadingApps.asStateFlow()
+
     private val _events = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val events: SharedFlow<String> = _events.asSharedFlow()
 
@@ -87,15 +100,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val profile = selectedProfile.value
             ?: return null to "ابتدا یک پروفایل ورکر ایجاد کنید"
         val currentSettings = settings.value
+        val selfPkg = getApplication<Application>().packageName
         val config = WorkerConfig(
             profileId = profile.id,
             profileName = profile.name,
             workerUrl = profile.workerUrl,
             uuid = profile.uuid,
             cleanIp = profile.cleanIp,
+            fakeDnsEnabled = currentSettings.fakeDnsEnabled,
+            localDnsEnabled = currentSettings.localDnsEnabled,
             sniSniffingEnabled = currentSettings.sniSniffingEnabled,
             localSocksEnabled = currentSettings.localSocksEnabled,
-            localSocksPort = currentSettings.localSocksPort
+            localSocksPort = currentSettings.localSocksPort,
+            perAppEnabled = currentSettings.perAppEnabled,
+            perAppBypassMode = currentSettings.perAppBypassMode,
+            perAppPackages = currentSettings.perAppPackages - selfPkg
         )
         val validationError = config.validate()
         if (validationError != null) {
@@ -238,6 +257,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setFakeDnsEnabled(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setFakeDnsEnabled(enabled)
+            VpnStateHolder.log(
+                LogLevel.INFO,
+                if (enabled) "Fake DNS (198.18.0.0/15) فعال شد" else "Fake DNS غیرفعال شد"
+            )
+        }
+    }
+
+    fun setLocalDnsEnabled(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setLocalDnsEnabled(enabled)
+            VpnStateHolder.log(
+                LogLevel.INFO,
+                if (enabled) "Local DNS (DoH 443) فعال شد" else "Local DNS غیرفعال شد"
+            )
+        }
+    }
+
     fun setSniSniffingEnabled(enabled: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.setSniSniffingEnabled(enabled)
@@ -255,6 +294,82 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 LogLevel.INFO,
                 if (enabled) "پروکسی محلی SOCKS5 فعال شد" else "پروکسی محلی SOCKS5 غیرفعال شد"
             )
+        }
+    }
+
+    fun setPerAppEnabled(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setPerAppEnabled(enabled)
+            VpnStateHolder.log(
+                LogLevel.INFO,
+                if (enabled) "Per-App Proxy فعال شد (در اتصال بعدی اعمال می‌شود)" else "Per-App Proxy غیرفعال شد"
+            )
+        }
+    }
+
+    fun setPerAppBypassMode(bypassMode: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setPerAppBypassMode(bypassMode)
+        }
+    }
+
+    fun togglePerAppPackage(packageName: String) {
+        val selfPkg = getApplication<Application>().packageName
+        if (packageName == selfPkg) return
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.togglePerAppPackage(packageName)
+        }
+    }
+
+    fun clearPerAppSelection() {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setPerAppPackages(emptySet())
+        }
+    }
+
+    fun openPerAppPicker() {
+        _perAppSheetOpen.value = true
+        if (_installedApps.value.isEmpty() && !_loadingApps.value) {
+            loadLaunchableApps()
+        }
+    }
+
+    fun closePerAppPicker() {
+        _perAppSheetOpen.value = false
+    }
+
+    private fun loadLaunchableApps() {
+        _loadingApps.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val app = getApplication<Application>()
+                val pm = app.packageManager
+                val selfPkg = app.packageName
+                val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                }
+                val resolved = pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
+                val uniqueApps = LinkedHashMap<String, InstalledAppInfo>()
+                for (info in resolved) {
+                    val pkg = info.activityInfo?.packageName ?: continue
+                    // Always exclude EdgeTunnel itself — it is permanently self-bypassed
+                    if (pkg == selfPkg || uniqueApps.containsKey(pkg)) continue
+                    val label = info.loadLabel(pm)?.toString()?.trim().orEmpty().ifEmpty { pkg }
+                    val bitmap = runCatching {
+                        info.loadIcon(pm)?.toBitmap(width = 72, height = 72)
+                    }.getOrNull()
+                    uniqueApps[pkg] = InstalledAppInfo(
+                        packageName = pkg,
+                        label = label,
+                        iconBitmap = bitmap
+                    )
+                }
+                _installedApps.value = uniqueApps.values.sortedBy { it.label.lowercase() }
+            } catch (_: Exception) {
+                _installedApps.value = emptyList()
+            } finally {
+                _loadingApps.value = false
+            }
         }
     }
 

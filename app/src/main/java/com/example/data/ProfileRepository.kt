@@ -66,9 +66,21 @@ class ProfileRepository(
         }
     }
 
+    suspend fun setFakeDnsEnabled(enabled: Boolean) = settingsStore.setFakeDnsEnabled(enabled)
+
+    suspend fun setLocalDnsEnabled(enabled: Boolean) = settingsStore.setLocalDnsEnabled(enabled)
+
     suspend fun setSniSniffingEnabled(enabled: Boolean) = settingsStore.setSniSniffingEnabled(enabled)
 
     suspend fun setLocalSocksEnabled(enabled: Boolean) = settingsStore.setLocalSocksEnabled(enabled)
+
+    suspend fun setPerAppEnabled(enabled: Boolean) = settingsStore.setPerAppEnabled(enabled)
+
+    suspend fun setPerAppBypassMode(bypassMode: Boolean) = settingsStore.setPerAppBypassMode(bypassMode)
+
+    suspend fun setPerAppPackages(packages: Set<String>) = settingsStore.setPerAppPackages(packages)
+
+    suspend fun togglePerAppPackage(packageName: String) = settingsStore.togglePerAppPackage(packageName)
 
     fun exportProfileUri(profile: ServerProfileEntity): String {
         return Uri.Builder()
